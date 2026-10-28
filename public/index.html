@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Workshop Sync</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%233b82f6' d='M8 1a7 7 0 1 0 7 7h-2a5 5 0 1 1-1.46-3.54L9 7h6V1l-2.05 2.05A7 7 0 0 0 8 1z'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="login" class="login" hidden>
+    <form id="loginForm" class="card login-card">
+      <h1>Workshop Sync</h1>
+      <label>Password <input type="password" id="loginPassword" autocomplete="current-password" required autofocus></label>
+      <button type="submit" class="primary">Sign in</button>
+      <p id="loginError" class="error"></p>
+    </form>
+  </div>
+
+  <div id="app" hidden>
+    <header class="topbar">
+      <div class="brand">Workshop Sync</div>
+      <nav id="tabs" class="tabs">
+        <button data-tab="accounts">Accounts</button>
+        <button data-tab="groups">Groups</button>
+        <button data-tab="main">Main account <span id="mainBadge" class="badge warn" hidden></span></button>
+        <button data-tab="jobs">Jobs</button>
+        <button data-tab="history">History</button>
+        <button data-tab="settings" data-admin>Settings</button>
+        <button data-tab="logs" data-admin>Logs</button>
+      </nav>
+      <div class="topbar-right">
+        <span id="roleBadge" class="badge"></span>
+        <button id="logoutBtn" class="ghost">Sign out</button>
+      </div>
+    </header>
+    <div id="banner" class="banner" hidden></div>
+    <main id="view"></main>
+  </div>
+
+  <dialog id="dialog"><form method="dialog" id="dialogForm"></form></dialog>
+  <div id="toast" class="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>

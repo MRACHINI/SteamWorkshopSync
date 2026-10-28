@@ -1,0 +1,9 @@
+node_modules/
+dist/
+data/
+*.log
+.env
+
+# Private planning material, not part of the public repository
+HANDOFF.md
+OtherAppJustForReference/
