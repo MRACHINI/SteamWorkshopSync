@@ -1,9 +1,11 @@
 import { type Account, listAccounts, q } from './db.js';
-import { type Group, groupApps, pendingCounts } from './groups.js';
+import { type Group, computeStart, groupApps, pendingCounts } from './groups.js';
 
 /** Read models for the web UI. publicAccount() is the only account shape that leaves the server. */
 
-function publicAccount(a: Account, extra: { pending: number; failing: number; subscribed: number; groups: { id: number; name: string }[] }) {
+function publicAccount(a: Account, extra: {
+  pending: number; pending_bytes: number; failing: number; subscribed: number; groups: { id: number; name: string }[];
+}) {
   return {
     id: a.id,
     username: a.username,
@@ -37,6 +39,7 @@ export function publicAccounts() {
   }
   return listAccounts().map((a) => publicAccount(a, {
     pending: counts.get(a.id)?.pending ?? 0,
+    pending_bytes: counts.get(a.id)?.bytes ?? 0,
     failing: counts.get(a.id)?.failing ?? 0,
     subscribed: subscribed.get(a.id) ?? 0,
     groups: groupsOf.get(a.id) ?? [],
@@ -51,6 +54,14 @@ function itemCounts(groupId: number): Record<string, number> {
     out[r.state] = r.n;
   }
   return out;
+}
+
+/** Total size of the group's synced items, and how many have no size from Steam (yet). */
+function activeSize(groupId: number): { bytes: number; unsized: number } {
+  return q(`SELECT COALESCE(SUM(i.file_size), 0) AS bytes, COALESCE(SUM(COALESCE(i.file_size, 0) = 0), 0) AS unsized
+            FROM group_items gi JOIN items i ON i.id = gi.item_id
+            JOIN group_apps ga ON ga.group_id = gi.group_id AND ga.appid = i.appid
+            WHERE gi.group_id = ? AND gi.state = 'active'`).get(groupId) as { bytes: number; unsized: number };
 }
 
 /** Subscriptions of active items that are in place, summed over all members. */
@@ -73,7 +84,7 @@ export function groupSummaries() {
     const members = memberCount(g.id);
     return {
       id: g.id, name: g.name, state: g.state, created_at: g.created_at, apps: groupApps(g.id), members, items: counts,
-      synced: syncedCells(g.id), cells: counts.active * members,
+      synced: syncedCells(g.id), cells: counts.active * members, ...activeSize(g.id),
     };
   });
 }
@@ -84,13 +95,15 @@ export function groupDetail(id: number) {
   const counts = itemCounts(id);
   const stats = new Map((q(`SELECT gm.account_id,
                               COALESCE(SUM(ai.present = 1), 0) AS has,
-                              COALESCE(SUM(ai.present = 0 AND ai.write_error != ''), 0) AS failing
+                              COALESCE(SUM(ai.present = 0 AND ai.write_error != ''), 0) AS failing,
+                              COALESCE(SUM(CASE WHEN COALESCE(ai.present, 0) = 0 THEN COALESCE(i.file_size, 0) ELSE 0 END), 0) AS missing_bytes
                             FROM group_members gm
                             JOIN group_items gi ON gi.group_id = gm.group_id AND gi.state = 'active'
                             JOIN items i ON i.id = gi.item_id
                             JOIN group_apps ga ON ga.group_id = gi.group_id AND ga.appid = i.appid
                             LEFT JOIN account_items ai ON ai.account_id = gm.account_id AND ai.item_id = gi.item_id
-                            WHERE gm.group_id = ? GROUP BY gm.account_id`).all(id) as { account_id: number; has: number; failing: number }[])
+                            WHERE gm.group_id = ? GROUP BY gm.account_id`).all(id) as
+    { account_id: number; has: number; failing: number; missing_bytes: number }[])
     .map((r) => [r.account_id, r]));
   const apps = groupApps(id);
   const members = (q(`SELECT a.id, a.username, a.is_main, a.enabled, a.status, a.status_msg, a.last_check_at FROM group_members gm
@@ -102,15 +115,18 @@ export function groupDetail(id: number) {
         !!(q('SELECT initialized FROM account_apps WHERE account_id = ? AND appid = ?').get(m.id, appid) as { initialized: number } | undefined)?.initialized);
       return {
         ...m, is_main: !!m.is_main, enabled: !!m.enabled, status: m.enabled ? m.status : 'disabled', read,
-        has: stats.get(m.id)?.has ?? 0, failing: stats.get(m.id)?.failing ?? 0,
+        has: stats.get(m.id)?.has ?? 0, failing: stats.get(m.id)?.failing ?? 0, missing_bytes: stats.get(m.id)?.missing_bytes ?? 0,
       };
     });
   return {
     group: {
       id: g.id, name: g.name, state: g.state, created_at: g.created_at, start_requested_at: g.start_requested_at,
-      preview: g.preview_json ? JSON.parse(g.preview_json) : null, apps,
+      // Recomputed while it waits, so sizes Steam reports after the first read show up, and it matches what
+      // confirming will do.
+      preview: g.state === 'preview' ? computeStart(g) : null, apps,
     },
     items: counts,
+    ...activeSize(id),
     synced: syncedCells(id),
     cells: counts.active * members.length,
     members,

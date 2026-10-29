@@ -430,23 +430,35 @@ export function hasPendingWrites(accountId: number, now: number): boolean {
   return pendingJobWrites(accountId, 1).length > 0 || pendingSyncWrites(accountId, now, 1).length > 0;
 }
 
-/** Per account: writes still needed, and how many of them last failed. */
-export function pendingCounts(): Map<number, { pending: number; failing: number }> {
-  const out = new Map<number, { pending: number; failing: number }>();
+export interface PendingCount {
+  pending: number;
+  failing: number;
+  /** Size of the items still to be subscribed (what the account will download), as far as Steam told us. */
+  bytes: number;
+}
+
+/** Per account: writes still needed, how many of them last failed, and the size still to download. */
+export function pendingCounts(): Map<number, PendingCount> {
+  const out = new Map<number, PendingCount>();
   const rows = q(`WITH w AS (${WANT.replace('%FILTER%', '')})
                   SELECT w.account_id,
                     SUM(CASE WHEN ${NEEDED} THEN 1 ELSE 0 END) AS pending,
-                    SUM(CASE WHEN ${NEEDED} AND ai.write_error != '' THEN 1 ELSE 0 END) AS failing
+                    SUM(CASE WHEN ${NEEDED} AND ai.write_error != '' THEN 1 ELSE 0 END) AS failing,
+                    SUM(CASE WHEN ${NEEDED} AND w.sub = 1 THEN COALESCE(i.file_size, 0) ELSE 0 END) AS bytes
                   FROM w JOIN items i ON i.id = w.item_id
                   JOIN account_apps aa ON aa.account_id = w.account_id AND aa.appid = w.appid AND aa.initialized = 1
                   LEFT JOIN account_items ai ON ai.account_id = w.account_id AND ai.item_id = w.item_id
-                  GROUP BY w.account_id`).all() as { account_id: number; pending: number; failing: number }[];
-  for (const r of rows) out.set(r.account_id, { pending: r.pending, failing: r.failing });
-  const jobs = q("SELECT account_id, COUNT(*) AS n FROM job_items ji JOIN jobs j ON j.id = ji.job_id AND j.status = 'running' WHERE ji.state = 'pending' GROUP BY account_id")
-    .all() as { account_id: number; n: number }[];
+                  GROUP BY w.account_id`).all() as unknown as ({ account_id: number } & PendingCount)[];
+  for (const r of rows) out.set(r.account_id, { pending: r.pending, failing: r.failing, bytes: r.bytes });
+  const jobs = q(`SELECT ji.account_id, COUNT(*) AS n,
+                    SUM(CASE WHEN j.action = 'subscribe' THEN COALESCE(i.file_size, 0) ELSE 0 END) AS bytes
+                  FROM job_items ji JOIN jobs j ON j.id = ji.job_id AND j.status = 'running' JOIN items i ON i.id = ji.item_id
+                  WHERE ji.state = 'pending' GROUP BY ji.account_id`)
+    .all() as { account_id: number; n: number; bytes: number }[];
   for (const r of jobs) {
-    const e = out.get(r.account_id) ?? { pending: 0, failing: 0 };
+    const e = out.get(r.account_id) ?? { pending: 0, failing: 0, bytes: 0 };
     e.pending += r.n;
+    e.bytes += r.bytes;
     out.set(r.account_id, e);
   }
   return out;
@@ -534,8 +546,11 @@ const unreadable = (a: Account) => !a.enabled || STUCK.has(a.status) || a.fail_c
 export interface StartPlan {
   items: string[];
   approvals: { item: string; groups: number[] }[];
-  perAccount: { id: number; username: string; is_main: boolean; has: number; missing: number; unreadable: boolean }[];
+  perAccount: { id: number; username: string; is_main: boolean; has: number; missing: number; missingBytes: number; unreadable: boolean }[];
   writes: number;
+  /** Total size of the shared items, and how many of them Steam has not given a size for (yet). */
+  bytes: number;
+  unsized: number;
   computed_at: number;
 }
 
@@ -567,13 +582,21 @@ export function computeStart(g: Group): StartPlan {
       else union.add(r.item_id);
     }
   }
+  const sizeOf = (id: string) => (q('SELECT file_size FROM items WHERE id = ?').get(id) as { file_size: number | null } | undefined)?.file_size ?? 0;
+  const sizes = new Map([...union].map((id) => [id, sizeOf(id)]));
+  const total = [...sizes.values()].reduce((n, b) => n + b, 0);
   const perAccount = members.map((m) => {
-    const has = presentOf(m.id).filter((r) => union.has(r.item_id)).length;
-    return { id: m.id, username: m.username, is_main: !!m.is_main, has, missing: union.size - has, unreadable: unreadable(m) };
+    const mine = presentOf(m.id).filter((r) => union.has(r.item_id));
+    const hasBytes = mine.reduce((n, r) => n + (sizes.get(r.item_id) ?? 0), 0);
+    return {
+      id: m.id, username: m.username, is_main: !!m.is_main, has: mine.length, missing: union.size - mine.length,
+      missingBytes: total - hasBytes, unreadable: unreadable(m),
+    };
   });
   return {
     items: [...union], approvals, perAccount,
-    writes: perAccount.reduce((n, a) => n + a.missing, 0), computed_at: Date.now(),
+    writes: perAccount.reduce((n, a) => n + a.missing, 0),
+    bytes: total, unsized: [...sizes.values()].filter((b) => !b).length, computed_at: Date.now(),
   };
 }
 
