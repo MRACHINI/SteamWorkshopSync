@@ -77,6 +77,20 @@ function ago(ts) {
   return d >= 0 ? `${s} ago` : `in ${s}`;
 }
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+/** Bytes as KB/MB/GB; unknown sizes (Steam reported none) show as a dash. */
+function fmtSize(bytes) {
+  if (!bytes) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let n = bytes;
+  let u = 0;
+  while (n >= 1024 && u < units.length - 1) {
+    n /= 1024;
+    u++;
+  }
+  return `${n >= 100 || u === 0 ? Math.round(n) : n.toFixed(1)} ${units[u]}`;
+}
+/** A total with a note when some items have no size from Steam (yet). */
+const sizeTotal = (bytes, unsized) => `${fmtSize(bytes)}${unsized ? ` <span class="small muted" title="Steam gave no size for these (yet)">+${unsized} unknown</span>` : ''}`;
 
 const ACCOUNT_STATUS = {
   ok: ['ok', 'OK'], new: ['dim', 'New'], error: ['bad', 'Error'], rate_limited: ['warn', 'Rate limited'],
@@ -298,7 +312,8 @@ function drawAccounts() {
       <td>${badge(ACCOUNT_STATUS, a.status)}${a.status_msg && a.status !== 'ok' ? `<div class="small muted wrap">${esc(a.status_msg)}</div>` : ''}</td>
       <td>${a.groups.map((g) => `<a class="chip" href="#groups/${g.id}">${esc(g.name)}</a>`).join('') || '<span class="muted small">none</span>'}</td>
       <td class="num">${a.subscribed}</td>
-      <td class="num">${a.pending || ''}${a.failing ? ` <span class="error small" title="refused by Steam, retried later">(${a.failing} failing)</span>` : ''}</td>
+      <td class="num">${a.pending || ''}${a.pending_bytes ? `<div class="small muted" title="still to download">${fmtSize(a.pending_bytes)}</div>` : ''}
+        ${a.failing ? ` <span class="error small" title="refused by Steam, retried later">(${a.failing} failing)</span>` : ''}</td>
       <td class="hide-sm" title="${esc(fmtTime(a.last_check_at))}">${esc(ago(a.last_check_at))}</td>
       <td class="hide-sm small">${signin(a)}</td>
       <td class="actions">${isAdmin() ? `
@@ -505,7 +520,7 @@ function drawGroups() {
     return `<div class="card group-card" data-group="${g.id}">
       <div class="title"><span>${esc(g.name)}</span>${badge(GROUP_STATE, g.state)}</div>
       <div class="small muted">Games ${g.apps.map((a) => `<span class="chip">${a}</span>`).join('')} · ${plural(g.members, 'member')}</div>
-      <div class="small">${g.items.active} synced${g.items.blocked ? ` · ${g.items.blocked} blocked` : ''}${g.items.removing ? ` · ${g.items.removing} removing` : ''}</div>
+      <div class="small">${g.items.active} synced${g.items.active ? ` · ${sizeTotal(g.bytes, g.unsized)}` : ''}${g.items.blocked ? ` · ${g.items.blocked} blocked` : ''}${g.items.removing ? ` · ${g.items.removing} removing` : ''}</div>
       ${g.state === 'active' || g.state === 'paused' ? `<div class="progress" title="${g.synced} of ${g.cells} subscriptions in place"><div style="width:${pct}%"></div></div>
         <div class="small muted">${pct}% in place</div>` : ''}
     </div>`;
@@ -631,6 +646,7 @@ function drawGroupDetail(redrawItems = true) {
       <div class="stat"><b>${g.apps.join(', ')}</b><span>games</span></div>
       <div class="stat"><b>${gDetail.members.length}</b><span>members</span></div>
       <div class="stat"><b>${gDetail.items.active}</b><span>synced items</span></div>
+      <div class="stat"><b>${sizeTotal(gDetail.bytes, gDetail.unsized)}</b><span>total size</span></div>
       <div class="stat"><b>${gDetail.synced} / ${gDetail.cells}</b><span>subscriptions in place (${pct}%)</span></div>
       ${gDetail.items.blocked ? `<div class="stat"><b>${gDetail.items.blocked}</b><span>blocked</span></div>` : ''}
       ${gDetail.items.removing ? `<div class="stat"><b>${gDetail.items.removing}</b><span>being removed</span></div>` : ''}
@@ -639,22 +655,23 @@ function drawGroupDetail(redrawItems = true) {
   const p = g.preview;
   $('#gPreview').innerHTML = g.state === 'preview' && p ? `<div class="card">
       <h2>Preview of the first sync</h2>
-      <p>${plural(p.items.length, 'item')} will be shared with every member: ${plural(p.writes, 'subscription')} to make.
+      <p>${plural(p.items.length, 'item')} (${sizeTotal(p.bytes, p.unsized)}) will be shared with every member: ${plural(p.writes, 'subscription')} to make.
         ${p.approvals.length ? `${plural(p.approvals.length, 'item')} on the main account also match another group and will wait for you to pick one.` : ''}</p>
-      <table><thead><tr><th>Account</th><th class="num">Already has</th><th class="num">Will get</th><th></th></tr></thead>
+      <table><thead><tr><th>Account</th><th class="num">Already has</th><th class="num">Will get</th><th class="num">To download</th><th></th></tr></thead>
       <tbody>${p.perAccount.map((a) => `<tr><td>${esc(a.username)} ${a.is_main ? '<span class="badge">main</span>' : ''}</td>
-        <td class="num">${a.has}</td><td class="num">${a.missing}</td>
+        <td class="num">${a.has}</td><td class="num">${a.missing}</td><td class="num">${a.missing ? fmtSize(a.missingBytes) : ''}</td>
         <td>${a.unreadable ? '<span class="badge bad">could not be read: it gets its share once it works</span>' : ''}</td></tr>`).join('')}</tbody></table>
       ${isAdmin() ? `<div class="toolbar" style="margin-top:12px">${btn('confirm', 'Start syncing', 'primary')}${btn('start', 'Read again')}</div>` : ''}
-      <p class="small muted">Computed ${esc(ago(p.computed_at))}. Steam is not touched until you start.</p>
+      <p class="small muted">Steam is not touched until you start. Sizes fill in over a few minutes after the first read.</p>
     </div>` : '';
 
   $('#gMembers').innerHTML = `<h2>Members</h2><table>
-    <thead><tr><th>Account</th><th>Status</th><th class="num">Has</th><th class="num">Failing</th></tr></thead>
+    <thead><tr><th>Account</th><th>Status</th><th class="num">Has</th><th class="num">To download</th><th class="num">Failing</th></tr></thead>
     <tbody>${gDetail.members.map((m) => `<tr>
       <td>${esc(m.username)} ${m.is_main ? '<span class="badge">main</span>' : ''}</td>
       <td>${badge(ACCOUNT_STATUS, m.status)} ${m.read ? '' : '<span class="badge dim">not read yet</span>'}</td>
       <td class="num">${m.has} / ${gDetail.items.active}</td>
+      <td class="num">${m.has < gDetail.items.active ? fmtSize(m.missing_bytes) : ''}</td>
       <td class="num">${m.failing ? `<span class="error">${m.failing}</span>` : ''}</td></tr>`).join('')}</tbody></table>`;
 
   $('#gColls').innerHTML = gDetail.collections.length ? `<table><tbody>${gDetail.collections.map((c) => `<tr>
@@ -680,13 +697,14 @@ function drawItems() {
     return b('restore', 'Add back');
   };
   $('#gItems').innerHTML = list.length ? `<table>
-    <thead><tr><th>Item</th><th>State</th><th class="num">On accounts</th><th class="hide-sm">Source</th><th></th></tr></thead>
+    <thead><tr><th>Item</th><th class="num">Size</th><th>State</th><th class="num">On accounts</th><th class="hide-sm">Source</th><th></th></tr></thead>
     <tbody>${shown.map((i) => `<tr data-row="${esc(i.id)}">
       <td>${i.preview_url ? `<img class="thumb" loading="lazy" src="${esc(i.preview_url)}" alt="">` : ''}
         <a href="${workshopUrl(i.id)}" target="_blank" rel="noopener">${esc(i.title || i.id)}</a>
         ${i.status !== 'ok' ? '<span class="badge bad">unavailable on Steam</span>' : ''}
         ${i.in_filter ? '' : '<span class="badge dim">game not in this group</span>'}
         <div class="small muted mono">${esc(i.id)} · app ${i.appid}</div></td>
+      <td class="num" style="white-space:nowrap">${fmtSize(i.file_size)}</td>
       <td>${badge(ITEM_STATE, i.state)}</td>
       <td class="num"><a href="#" data-act="cells" data-id="${esc(i.id)}">${i.present} / ${members}</a>
         ${i.failing ? `<div class="small error">${i.failing} failing</div>` : ''}</td>
@@ -704,7 +722,7 @@ async function showCells(itemId, rowEl) {
   const { cells } = await api('GET', `/api/groups/${route.id}/items/${itemId}`);
   const tr = document.createElement('tr');
   tr.dataset.cells = '1';
-  tr.innerHTML = `<td colspan="5"><div class="cells">${cells.map((c) => {
+  tr.innerHTML = `<td colspan="6"><div class="cells">${cells.map((c) => {
     const cls = c.present ? 'ok' : c.write_error ? 'bad' : c.removal_held ? 'warn' : c.read ? 'dim' : 'dim';
     const what = c.present ? 'subscribed' : c.removal_held ? 'removal held' : !c.read ? 'not read yet' : c.write_error ? c.write_error : 'not subscribed';
     const retry = c.write_error && c.write_next_at ? ` (retry ${ago(c.write_next_at)})` : '';

@@ -308,3 +308,20 @@ test('a main-account list that suddenly shows nothing is held, not removed from 
   assert.equal(groups.listHeld().length, 0, 'the items came back, nothing left to decide');
   assert.equal(itemState(g1, c(4)), 'active');
 });
+
+test('sizes: group total, still to download per member, and per account', async () => {
+  const views = await import('../dist/views.js');
+  steam.addItem(c(10), CS2, 'CS2 map 10');
+  const r = await groups.addToGroup(g1, [c(10)], 5000);
+  assert.equal(r.added, 1);
+  const d = views.groupDetail(g1);
+  assert.ok(d.bytes >= 1000, `group total ${d.bytes}`);
+  for (const m of d.members) assert.ok(m.missing_bytes >= 1000, `${m.username} still has to download the new map`);
+  const acc = views.publicAccounts().find((a) => a.username === 'alpha');
+  assert.ok(acc.pending_bytes >= 1000);
+  // Not settle(): the earlier "never listed" writes stay pending until their retry an hour later.
+  await rounds(3);
+  assert.ok(has(A, c(10)) && has(B, c(10)) && has(M, c(10)));
+  assert.equal(views.publicAccounts().find((a) => a.username === 'alpha').pending_bytes, 0);
+  assert.equal(views.groupDetail(g1).members.find((m) => m.username === 'alpha').missing_bytes, 0);
+});
