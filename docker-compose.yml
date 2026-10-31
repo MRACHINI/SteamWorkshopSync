@@ -4,11 +4,13 @@ services:
     container_name: steamworkshopsync
     restart: unless-stopped
     ports:
-      - "8090:8080"
-    environment:
-      ADMIN_PASSWORD: change-me
-      # Behind a reverse proxy, list its address(es) so the login limiter sees real client IPs:
-      # TRUST_PROXY: 172.16.0.0/12
+      # This machine only. To reach it from elsewhere use "8090:8080", but put HTTPS in front first: see HTTPS in the README.
+      - "127.0.0.1:8090:8080"
+    # environment:
+      # Pick your own. Without one, a password is generated into ./data/admin-password.txt.
+      # ADMIN_PASSWORD: pick-a-long-password
+      # Behind a reverse proxy, name exactly that proxy, so the login limiter sees real client IPs:
+      # TRUST_PROXY: 172.18.0.5
     volumes:
       - ./data:/data
     mem_limit: 256m

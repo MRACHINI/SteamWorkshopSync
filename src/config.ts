@@ -5,7 +5,11 @@ export const PORT = Number(process.env.PORT ?? 8080);
 export const HOST = process.env.HOST ?? '0.0.0.0';
 export const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? '';
 export const SECRET_KEY = process.env.SECRET_KEY ?? '';
-// Address(es) of the reverse proxy in front of the app, e.g. "127.0.0.1" or "172.16.0.0/12" (comma separated).
+// Certificate and key files, to serve HTTPS directly instead of through a reverse proxy.
+export const TLS_CERT_FILE = (process.env.TLS_CERT_FILE ?? '').trim();
+export const TLS_KEY_FILE = (process.env.TLS_KEY_FILE ?? '').trim();
+// Address(es) of the reverse proxy in front of the app, e.g. "127.0.0.1" or "172.18.0.5" (comma separated).
+// Name the proxy itself: a wide range can include clients, which could then fake their address.
 // Only requests coming from these addresses may set X-Forwarded-For / X-Forwarded-Host. Empty = no proxy.
 // Deliberately not a yes/no switch: trusting every hop would let clients fake their IP and dodge the login limit.
 export const TRUST_PROXY = (process.env.TRUST_PROXY ?? '').trim();
@@ -24,11 +28,11 @@ export const DEFAULT_SETTINGS = {
   full_read_hours: '24',
   concurrency: '4',
   request_timeout_seconds: '20',
-  // Subscribe/unsubscribe pacing. Steam took 160 writes in 4 minutes without throttling in testing;
-  // these defaults stay well below that because hourly or daily caps are unknown.
+  // Subscribe/unsubscribe pacing. Steam took 160 writes in 4 minutes without throttling in testing, a rate of
+  // 2400 per hour. The hourly cap stays at that rate because longer limits are unknown.
   write_gap_ms: '2000',
   writes_per_run: '30',
-  writes_per_hour: '3600',
+  writes_per_hour: '2400',
   // Password logins are spaced out so a batch of new accounts does not trip Steam's login throttle.
   login_gap_seconds: '15',
   // More items than this disappearing from the main account at once waits for approval instead of
@@ -51,7 +55,7 @@ export const DEFAULT_SETTINGS = {
   template_removed: ['🗑 #Removed #{group}', '{count} removed from the main account, unsubscribing every member', '{items}'].join('\n'),
   template_held: [
     '✋ #RemovalHeld #{account}',
-    '{count} items disappeared from the main account at once. Approve or restore them in the web UI.',
+    '{count} items left the main account at once, or Steam refused them. Approve or restore them in the web UI.',
     '{items}',
   ].join('\n'),
   template_approval: ['❓ #PickGroup', '{count} new items on the main account match more than one group. Pick the group in the web UI.', '{items}'].join('\n'),

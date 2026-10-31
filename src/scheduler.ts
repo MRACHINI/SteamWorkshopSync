@@ -1,5 +1,5 @@
 import { type Account, STUCK, listAccounts, numSetting, pruneHistory } from './db.js';
-import { completeRemovals, hasPendingWrites, progressStarts, refreshCollections, refreshDetails, relevantApps } from './groups.js';
+import { completeRemovals, hasPendingWrites, progressStarts, refreshCollections, refreshDetails, relevantApps, settleMainRemovals } from './groups.js';
 import { finishJobs } from './jobs.js';
 import { errMsg, log } from './log.js';
 import { flushNotifications } from './notify.js';
@@ -26,7 +26,8 @@ const nudge = () => {
   if (wake) wake();
   else wakePending = true;
 };
-// Explicit per-account checks (true = full read): run even if parked or backing off.
+// Explicit per-account checks (true = full read): run even while backing off, but never for an account
+// parked with a known-bad password or no sign-in: that needs the admin, and a login would only fail again.
 const forced = new Map<number, boolean>();
 // "Check all now": skip back-off and the rate-limit pause, but leave parked accounts parked.
 let forceAll = false;
@@ -53,8 +54,8 @@ const checkInterval = () => numSetting('check_interval_seconds', 60, 7 * 86400) 
 /** What an account is due for right now, if anything. */
 function taskFor(a: Account, now: number): Task | null {
   if (!a.enabled) return null;
+  if (STUCK.has(a.status)) return null;
   const force = forced.has(a.id);
-  if (!force && STUCK.has(a.status)) return null;
   if (!force && !forceAll && sane(a.next_attempt_at, now, 3 * HOUR) > now) return null;
   if (!force && !forceAll && now < syncState.pausedUntil) return null;
   // Accounts in no group are only read once, to prove the sign-in works.
@@ -62,7 +63,7 @@ function taskFor(a: Account, now: number): Task | null {
   const check = force || (readable && (forceAll || sane(a.next_check_at, now, checkInterval() + DAY) <= now));
   const writes = writesAllowed(now) && sane(a.write_next_at, now, 2 * HOUR) <= now;
   if (!check && !(writes && hasPendingWrites(a.id, now))) return null;
-  return { check, full: forced.get(a.id) ?? false, writes };
+  return { check, full: forced.get(a.id) ?? false, writes, forced: force || forceAll };
 }
 
 /** When the next piece of work is due, so the sleep below matches what cycle() will pick up. */
@@ -82,6 +83,7 @@ function nextDueAt(now: number): number {
 
 /** Free-API and database chores that need no account session. */
 async function housekeeping(): Promise<void> {
+  settleMainRemovals(); // anything a crash left undecided
   progressStarts();
   completeRemovals();
   finishJobs();
@@ -107,7 +109,10 @@ export async function cycle(): Promise<void> {
     await Promise.all(
       Array.from({ length: workers }, async () => {
         for (let item = queue.shift(); item !== undefined; item = queue.shift()) {
+          // Steam asked for less while this account waited in the queue.
+          if (!item.task.forced && Date.now() < syncState.pausedUntil) continue;
           await runAccount(item.id, item.task).catch((e) => log.error(`account run crashed: ${errMsg(e)}`));
+          syncState.lastBeatAt = Date.now();
           await new Promise((r) => setTimeout(r, 150 + Math.random() * 350)); // small jitter between accounts
         }
       }),
@@ -128,6 +133,7 @@ export async function runScheduler(): Promise<never> {
   let lastPrune = 0;
   for (;;) {
     const started = Date.now();
+    syncState.lastBeatAt = started;
     try {
       await cycle();
       await flush();
@@ -143,7 +149,12 @@ export async function runScheduler(): Promise<never> {
       wakePending = false; // something was requested while the cycle ran: start the next one at once
       continue;
     }
-    const due = nextDueAt(Date.now());
+    let due = Infinity;
+    try {
+      due = nextDueAt(Date.now());
+    } catch (e) {
+      log.error(`could not work out the next run: ${errMsg(e)}`);
+    }
     const wait = Math.min(MAX_SLEEP, Math.max(1000, due - Date.now()));
     await new Promise<void>((resolve) => {
       const t = setTimeout(resolve, wait);

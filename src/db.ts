@@ -2,9 +2,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { DATA_DIR, DEFAULT_SETTINGS, type SettingKey } from './config.js';
+import { decrypt, encrypt } from './crypto.js';
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
-export const db = new DatabaseSync(path.join(DATA_DIR, 'workshopsync.db'));
+const DB_FILE = path.join(DATA_DIR, 'workshopsync.db');
+export const db = new DatabaseSync(DB_FILE);
+
+// The database holds the viewer hash and account data, so only the app's own user may read it. SQLite gives
+// the -wal and -shm files the same mode as the database. Also tightens files made by earlier versions.
+for (const file of [DB_FILE, `${DB_FILE}-wal`, `${DB_FILE}-shm`]) {
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {
+    // not there yet, or a filesystem without modes
+  }
+}
 
 db.exec(`
 PRAGMA journal_mode = WAL;
@@ -187,6 +199,35 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- Items a running job is taking out of a group, so cancelling the job can put them back.
+CREATE TABLE IF NOT EXISTS job_group_items (
+  job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+  item_id TEXT NOT NULL REFERENCES items(id),
+  PRIMARY KEY (job_id, group_id, item_id)
+);
+
+-- What the next Telegram summary will say. Kept here so a restart in the middle of a cycle loses nothing.
+CREATE TABLE IF NOT EXISTS pending_notes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  group_id INTEGER NOT NULL DEFAULT 0,
+  account TEXT NOT NULL DEFAULT '',
+  item TEXT NOT NULL
+);
+
+-- Writes per minute, so the hourly cap survives a restart.
+CREATE TABLE IF NOT EXISTS write_log (
+  minute INTEGER PRIMARY KEY,
+  n INTEGER NOT NULL
+);
+
+-- Sessions signed out before they expired.
+CREATE TABLE IF NOT EXISTS revoked_sessions (
+  sig TEXT PRIMARY KEY,
+  exp INTEGER NOT NULL
+);
 `);
 
 /** Adds missing columns in place, so later versions upgrade a database without losing data. */
@@ -196,6 +237,12 @@ export function addColumns(table: string, columns: [string, string][]): void {
     if (!existing.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
   }
 }
+
+// 1.1.0
+addColumns('account_apps', [['short_by', 'INTEGER NOT NULL DEFAULT 0']]);
+addColumns('account_items', [['held_reason', "TEXT NOT NULL DEFAULT ''"], ['unsubscribed_at', 'INTEGER']]);
+addColumns('job_items', [['attempts', 'INTEGER NOT NULL DEFAULT 0'], ['next_at', 'INTEGER NOT NULL DEFAULT 0']]);
+addColumns('jobs', [['signature', "TEXT NOT NULL DEFAULT ''"]]);
 
 /** Account statuses that need the admin (password, sign-in) before anything is retried. */
 export const STUCK = new Set(['bad_credentials', 'needs_signin']);
@@ -296,10 +343,23 @@ export function addEvent(acc: { id: number; username: string } | null, type: str
   );
 }
 
+/** Settings stored encrypted, like the account secrets. */
+const SECRET_SETTINGS: SettingKey[] = ['telegram_bot_token'];
+const SEALED = 'enc:';
+
+function openSecret(value: string): string {
+  if (!value.startsWith(SEALED)) return value; // stored by an earlier version
+  try {
+    return decrypt(value.slice(SEALED.length)) ?? '';
+  } catch {
+    return ''; // encrypted with another key: the admin has to enter it again
+  }
+}
+
 export function getSettings(): Record<SettingKey, string> {
   const out: Record<string, string> = { ...DEFAULT_SETTINGS };
   for (const row of q('SELECT key, value FROM settings').all() as { key: string; value: string }[]) {
-    if (row.key in DEFAULT_SETTINGS) out[row.key] = row.value;
+    if (row.key in DEFAULT_SETTINGS) out[row.key] = SECRET_SETTINGS.includes(row.key as SettingKey) ? openSecret(row.value) : row.value;
   }
   return out as Record<SettingKey, string>;
 }
@@ -314,7 +374,9 @@ export function numSetting(key: SettingKey, min: number, max: number): number {
 export function setSettings(values: Record<string, unknown>): void {
   const stmt = q('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
   for (const [k, v] of Object.entries(values)) {
-    if (k in DEFAULT_SETTINGS && v !== undefined && v !== null) stmt.run(k, String(v));
+    if (!(k in DEFAULT_SETTINGS) || v === undefined || v === null) continue;
+    const secret = SECRET_SETTINGS.includes(k as SettingKey) && v !== '';
+    stmt.run(k, secret ? `${SEALED}${encrypt(String(v))}` : String(v));
   }
 }
 
@@ -340,4 +402,15 @@ export function pruneHistory(days: number): void {
   // Messages that were never delivered would otherwise sit in the table for ever.
   q('DELETE FROM outbox WHERE sent_at IS NULL AND created_at < ?').run(cutoff);
   q("DELETE FROM jobs WHERE status != 'running' AND finished_at < ?").run(cutoff);
+  q('DELETE FROM revoked_sessions WHERE exp < ?').run(Date.now());
+  q('DELETE FROM write_log WHERE minute < ?').run(Math.floor(Date.now() / 60_000) - 120);
+}
+
+// Upgrades from before these rules: a token left in plain text, and a password stored for the main account.
+for (const key of SECRET_SETTINGS) {
+  const value = (q('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined)?.value;
+  if (value && !value.startsWith(SEALED)) setSettings({ [key]: value });
+}
+if (db.prepare('UPDATE accounts SET password_enc = NULL, interactive = 1 WHERE is_main = 1 AND password_enc IS NOT NULL').run().changes) {
+  addEvent(null, 'admin', "The main account's stored password was removed: it signs in from the web UI only");
 }

@@ -51,6 +51,8 @@ async function settle() {
 const has = (sid, id) => steam.subs(sid, steam.items.get(id).appid).includes(id);
 const itemState = (g, id) => q('SELECT state FROM group_items WHERE group_id = ? AND item_id = ?').get(g, id)?.state;
 const tg = (tag) => steam.telegram.filter((t) => t.includes(tag));
+/** Lets the time pass in which a list may still show an item this app unsubscribed. */
+const lagOver = () => q('UPDATE account_items SET unsubscribed_at = NULL').run();
 
 const M = '76561190000000001';
 const A = '76561190000000002';
@@ -126,6 +128,7 @@ test('an item a member loses is subscribed again, after two reads', async () => 
 
 test('an item the main account drops is removed from every member', async () => {
   steam.unsubscribe(M, c(1));
+  await rounds(3);
   await settle();
   await round();
   assert.ok(!has(A, c(1)) && !has(B, c(1)));
@@ -134,6 +137,7 @@ test('an item the main account drops is removed from every member', async () => 
 });
 
 test('a removed item that comes back on a member is synced again', async () => {
+  lagOver();
   steam.subscribe(A, c(1));
   await settle();
   assert.equal(itemState(g1, c(1)), 'active');
@@ -144,6 +148,7 @@ test('a blocked item is removed everywhere and again when it comes back', async 
   groups.itemAction(g1, c(5), 'block');
   await settle();
   assert.ok(!has(A, c(5)) && !has(B, c(5)) && !has(M, c(5)));
+  lagOver();
   steam.subscribe(B, c(5));
   await rounds(2);
   await settle();
@@ -196,9 +201,10 @@ test('jobs: a partial unsubscribe clashes; a full one takes the item out of the 
 
   const full = createJob('unsubscribe', [c(3)], [idM, idA, idB], false);
   assert.ok(full.jobId);
-  assert.equal(itemState(g1, c(3)), 'removed');
+  assert.equal(itemState(g1, c(3)), 'removing');
   await settle();
   await round();
+  assert.equal(itemState(g1, c(3)), 'removed');
   assert.ok(!has(M, c(3)) && !has(A, c(3)) && !has(B, c(3)));
   assert.equal(q('SELECT status FROM jobs WHERE id = ?').get(full.jobId).status, 'done');
   await rounds(2);

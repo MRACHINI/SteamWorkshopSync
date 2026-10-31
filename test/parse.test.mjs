@@ -29,9 +29,13 @@ test('anonymous or other-user pages mean "not logged in"', () => {
   assert.throws(() => parseSubsPage(page(entry(1), '"76561190000000099"'), SID), (e) => e.kind === 'not_logged_in');
 });
 
-test('a half-rendered page is refused', () => {
-  const html = page(`<div class="workshopBrowsePagingInfo">Showing 1-30 of 41 entries</div>${entry(1)}`);
-  assert.throws(() => parseSubsPage(html, SID), (e) => e.kind === 'temporary');
+test('a page with fewer entries than it promises is flagged, one with more is refused', () => {
+  const short = page(`<div class="workshopBrowsePagingInfo">Showing 1-30 of 41 entries</div>${entry(1)}`);
+  assert.equal(parseSubsPage(short, SID).short, true);
+  const full = page(`<div class="workshopBrowsePagingInfo">Showing 1-2 of 2 entries</div>${entry(1)}${entry(2)}`);
+  assert.equal(parseSubsPage(full, SID).short, false);
+  const more = page(`<div class="workshopBrowsePagingInfo">Showing 1-1 of 2 entries</div>${entry(1)}${entry(2)}`);
+  assert.throws(() => parseSubsPage(more, SID), (e) => e.kind === 'temporary');
 });
 
 test('pasted links and ids', () => {
