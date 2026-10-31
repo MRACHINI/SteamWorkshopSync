@@ -1,11 +1,13 @@
 import { decrypt, encrypt } from './crypto.js';
-import { type Account, STUCK, addEvent, addEventOnce, getAccount, getSettings, numSetting, q, updateAccount } from './db.js';
 import {
-  type PendingWrite, getAccountApp, hasPendingMissing, pendingJobWrites, pendingSyncWrites, presentSet,
-  recordFullRead, recordQuickRead, recordVerified, recordWrite, relevantApps, shortList,
+  type Account, STUCK, addEvent, addEventOnce, getAccount, getInternal, getSettings, numSetting, q, setInternal, updateAccount,
+} from './db.js';
+import {
+  type PendingWrite, failJobWrites, getAccountApp, hasPendingMissing, isPresent, pendingJobWrites, pendingSyncWrites, presentSet,
+  recordFullRead, recordQuickRead, recordVerified, recordWrite, relevantApps, settleMainRemovals, shortList, writeStillWanted,
 } from './groups.js';
 import { errMsg, log } from './log.js';
-import { note } from './notify.js';
+import { flushUrgentNotifications, note } from './notify.js';
 import {
   PAGE_SIZE, SteamError, type SubItem, type SubsPage, type Tokens, fetchSubsPage, jwtExpiresAt, jwtExpiresIn,
   loginWithPassword, profileBase, refreshCookies, setSubscription,
@@ -16,31 +18,54 @@ const MIN = 60_000;
 const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
 // Errors about the login/session itself; nothing else can run for the account this round.
-const SESSION_ERRORS = new Set(['bad_credentials', 'needs_guard', 'needs_signin', 'rate_limited', 'login_throttled', 'token_invalid', 'not_logged_in']);
+const SESSION_ERRORS = new Set(['bad_credentials', 'needs_guard', 'needs_signin', 'rate_limited', 'login_throttled', 'token_invalid', 'token_suspect', 'not_logged_in']);
 /** A quick check reads at most this many pages of new items before reading the whole list instead. */
 const QUICK_MAX_PAGES = 5;
 /** An item missing from a full read is confirmed by another full read this much later. */
 const CONFIRM_DELAY = 2 * MIN;
 const PAGE_GAP_MS = 600;
+const PAGE_RETRY_MS = 3000;
 /** Subscribes showed up on the list within seconds in testing; this leaves Steam a moment before checking. */
 const VERIFY_DELAY_MS = 2000;
 /** The list loaded to prove a sign-in works for an account that is in no group yet (any game would do). */
 const PROBE_APPID = 730;
+/** A saved sign-in that keeps failing to renew in an unclear way counts as dead after this many failed runs in a row. */
+const TOKEN_SUSPECT_FAILS = 10;
+/** With a stored password, the sign-in is renewed this long before it runs out, and tried again this often. */
+const EARLY_RENEWAL = 3 * DAY;
+const EARLY_RENEWAL_GAP = 6 * HOUR;
+/** After this many network errors in a row, a batch of writes stops: Steam is down, not one item. */
+const OUTAGE_WRITES = 3;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** A pause saved before a restart, capped in case the clock stepped since. */
+const savedPause = (key: string) => Math.min(Number(getInternal(`pause_${key}`)) || 0, Date.now() + 2 * HOUR);
+
 export const syncState = {
   /** Steam answered 429: only explicitly requested accounts run until then. */
-  pausedUntil: 0,
+  pausedUntil: savedPause('pausedUntil'),
   /** Steam is throttling password logins from this IP. */
-  loginPausedUntil: 0,
-  loginPauseMs: 0,
+  loginPausedUntil: savedPause('loginPausedUntil'),
+  loginPauseMs: Number(getInternal('pause_loginPauseMs')) || 0,
   /** Steam throttled a write: no writes until then. */
-  writePausedUntil: 0,
+  writePausedUntil: savedPause('writePausedUntil'),
+  /** Last sign of life from the sync, for the health check. */
+  lastBeatAt: Date.now(),
 };
 
-// Timestamps of the writes in the last hour, for the hourly cap.
-const writeTimes: number[] = [];
+function savePauses(): void {
+  for (const key of ['pausedUntil', 'loginPausedUntil', 'loginPauseMs', 'writePausedUntil'] as const) setInternal(`pause_${key}`, String(syncState[key]));
+}
+
+// Timestamps of the writes in the last hour, for the hourly cap. Survives a restart through write_log.
+const writeTimes: number[] = (q('SELECT minute, n FROM write_log WHERE minute >= ? ORDER BY minute').all(Math.floor((Date.now() - HOUR) / MIN)) as
+  { minute: number; n: number }[]).flatMap((r) => Array<number>(r.n).fill(r.minute * MIN));
+
+function countWrite(now: number): void {
+  writeTimes.push(now);
+  q('INSERT INTO write_log (minute, n) VALUES (?, 1) ON CONFLICT(minute) DO UPDATE SET n = n + 1').run(Math.floor(now / MIN));
+}
 
 export function writesLastHour(now = Date.now()): number {
   while (writeTimes.length && writeTimes[0] <= now - HOUR) writeTimes.shift();
@@ -81,9 +106,15 @@ function noteLoginThrottle(): void {
   // 30 min, then doubling up to 2 h while Steam keeps refusing; reset by the next successful login.
   syncState.loginPauseMs = syncState.loginPauseMs ? Math.min(2 * HOUR, syncState.loginPauseMs * 2) : 30 * MIN;
   syncState.loginPausedUntil = Date.now() + syncState.loginPauseMs;
+  savePauses();
   log.warn(`Steam is throttling logins: password logins paused for ${syncState.loginPauseMs / MIN} min`);
   addEvent(null, 'problem', `Steam is throttling logins: password logins paused for ${syncState.loginPauseMs / MIN} min`, true);
 }
+
+// When each account last tried its early renewal. Losing this on a restart costs one extra attempt.
+const earlyRenewalAt = new Map<number, number>();
+// Runs in a row that ended on an unclear renewal failure. Not fail_count: an outage of any kind raises that.
+export const tokenSuspects = new Map<number, number>();
 
 // ---------------------------------------------------------------------------
 // One account
@@ -95,11 +126,15 @@ export interface Task {
   full: boolean;
   /** Writes may run (no throttle pause, hourly cap not reached). */
   writes: boolean;
+  /** Explicitly requested: runs through a rate-limit pause. */
+  forced: boolean;
 }
 
 interface Ctx {
   acc: Account;
   page: (appid: number, page: number) => Promise<SubsPage>;
+  /** The next page starts from the profile's permanent address, which also shows if its custom URL changed. */
+  useCanonicalBase: () => void;
   write: (w: PendingWrite) => ReturnType<typeof setSubscription>;
 }
 
@@ -140,16 +175,18 @@ export async function runAccount(id: number, task: Task): Promise<void> {
       addEvent(acc!, 'login', 'Logged in with password');
       reload();
     };
+    const saveRotated = (token: string) => {
+      // A sign-in from the web UI during this run is newer than anything this run holds.
+      if (decrypt(getAccount(id)?.refresh_token_enc ?? null) !== refreshToken) return;
+      refreshToken = token;
+      updateAccount(id, { refresh_token_enc: encrypt(token), token_expires_at: jwtExpiresAt(token), token_warned: 0 });
+      log.info(`${acc!.username}: Steam renewed the saved sign-in`);
+    };
     const renewCookies = async () => {
-      const r = await refreshCookies({ steamid: acc!.steamid!, refreshToken: refreshToken! }, timeoutMs);
+      const r = await refreshCookies({ steamid: acc!.steamid!, refreshToken: refreshToken! }, timeoutMs, saveRotated);
       cookies = r.cookies;
-      const rotated = r.refreshToken !== refreshToken;
-      refreshToken = r.refreshToken;
-      updateAccount(id, {
-        cookies_enc: encrypt(r.cookies), refresh_token_enc: encrypt(r.refreshToken),
-        ...(rotated ? { token_expires_at: jwtExpiresAt(r.refreshToken), token_warned: 0 } : {}),
-      });
-      if (rotated) log.info(`${acc!.username}: Steam renewed the saved sign-in`);
+      tokenSuspects.delete(id);
+      updateAccount(id, { cookies_enc: encrypt(r.cookies) });
     };
     const cookiesFresh = () => {
       const jwt = cookies?.match(/steamLoginSecure=\d+%7C%7C([^;]+)/)?.[1];
@@ -157,8 +194,19 @@ export async function runAccount(id: number, task: Task): Promise<void> {
     };
 
     const left = refreshToken ? jwtExpiresIn(refreshToken) : 0;
-    // With a password the sign-in is renewed 3 days early; without one it is used until it runs out.
-    if (!refreshToken || !acc.steamid || left <= 0 || (password && left < 3 * DAY)) await login();
+    if (!refreshToken || !acc.steamid || left <= 0) {
+      await login();
+    } else if (password && !acc.interactive && left < EARLY_RENEWAL && Date.now() - (earlyRenewalAt.get(id) ?? 0) > EARLY_RENEWAL_GAP) {
+      // A courtesy while the sign-in still works, so failing it must not stop the account. Accounts that need
+      // Steam Guard cannot renew unattended: they are warned instead and used until the sign-in runs out.
+      earlyRenewalAt.set(id, Date.now());
+      await login().catch((e) => {
+        if (e instanceof SteamError && e.kind === 'needs_guard') updateAccount(id, { interactive: 1 });
+        reload();
+        log.warn(`${acc!.username}: early renewal of the sign-in failed: ${errMsg(e)}`);
+        addEventOnce(acc!, 'problem', `Early renewal of the sign-in failed: ${errMsg(e)}`, DAY);
+      });
+    }
 
     // Retries a request while renewing the session.
     const withSession = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -170,8 +218,8 @@ export async function runAccount(id: number, task: Task): Promise<void> {
         } catch (e) {
           if (!(e instanceof SteamError) || attempt >= 3) throw e;
           if (e.kind === 'not_logged_in') cookies = null;
-          else if (e.kind === 'token_invalid') await login();
-          else if (e.kind === 'temporary' && !retried) {
+          else if (e.kind === 'token_invalid' || (e.kind === 'token_suspect' && (tokenSuspects.get(id) ?? 0) >= TOKEN_SUSPECT_FAILS)) await login();
+          else if ((e.kind === 'temporary' || e.kind === 'token_suspect') && !retried) {
             // Steam serves a half-rendered page now and then; one quiet retry avoids a pointless problem entry.
             retried = true;
             log.info(`${acc!.username}: ${errMsg(e)} - retrying once`);
@@ -186,11 +234,15 @@ export async function runAccount(id: number, task: Task): Promise<void> {
       acc,
       page: async (appid, p) => {
         const r = await withSession(() => fetchSubsPage(acc!.steamid!, base, appid, p, cookies!, timeoutMs));
+        syncState.lastBeatAt = Date.now();
         if (r.base !== base) {
           base = r.base;
           updateAccount(id, { profile_url: base });
         }
         return r.page;
+      },
+      useCanonicalBase: () => {
+        base = profileBase(acc!.steamid!);
       },
       write: (w) => withSession(() => setSubscription(w.action, w, cookies!, timeoutMs)),
     };
@@ -216,11 +268,17 @@ export async function runAccount(id: number, task: Task): Promise<void> {
           log.warn(`${acc.username}: app ${appid}: ${errMsg(e)}`);
         }
       }
-      updateAccount(id, { last_check_at: Date.now(), next_check_at: Date.now() + next });
+      if (acc.is_main) settleMainRemovals();
+      updateAccount(id, { ...(readError ? {} : { last_check_at: Date.now() }), next_check_at: Date.now() + next });
     }
     if (task.writes) {
       phase = 'write';
-      await runWrites(ctx);
+      try {
+        await runWrites(ctx);
+      } catch (e) {
+        // With a failed read to report too, that one goes first: it is what the account's next check depends on.
+        if (!readError || !(e instanceof SteamError) || e.kind !== 'temporary') throw e;
+      }
     }
     if (readError) {
       phase = 'read';
@@ -228,13 +286,19 @@ export async function runAccount(id: number, task: Task): Promise<void> {
     }
 
     reload();
-    if (acc.status !== 'ok') log.info(`${acc.username}: OK`);
-    updateAccount(id, { status: 'ok', status_msg: '', fail_count: 0, next_attempt_at: 0, problem_notified: 0, last_ok_at: Date.now() });
-    reload();
+    // Only a read proves the account works: a run of writes alone must not wipe the record of a failing read.
+    // An account in no group is never read again, so there its writes are all the proof there will be.
+    if (task.check || !relevantApps(id).length) {
+      if (acc.status !== 'ok') log.info(`${acc.username}: OK`);
+      updateAccount(id, { status: 'ok', status_msg: '', fail_count: 0, next_attempt_at: 0, problem_notified: 0, last_ok_at: Date.now() });
+      reload();
+    }
     warnTokenExpiry(acc);
   } catch (e) {
     reload();
     handleFailure(acc, e, phase);
+  } finally {
+    if (acc.is_main) flushUrgentNotifications();
   }
 }
 
@@ -256,6 +320,11 @@ async function checkApp(ctx: Ctx, appid: number, forceFull: boolean): Promise<'o
     for (let p = 1; ; p++) {
       const page = await ctx.page(appid, p);
       if (p === 1) total = page.total ?? 0;
+      // A short page is a job for the full read, unless this list is known to be short anyway.
+      if (page.short && !st.short_by) {
+        full = true;
+        break;
+      }
       const unknown = page.items.filter((i) => !known.has(i.id));
       for (const i of unknown) fresh.set(i.id, i);
       // Newest first: once a page shows an item already known, the rest is known too.
@@ -272,6 +341,7 @@ async function checkApp(ctx: Ctx, appid: number, forceFull: boolean): Promise<'o
     }
     if (!full) log.info(`${acc.username}: app ${appid} lists ${total} subscription(s), expected ${st.last_total + fresh.size}; reading the whole list`);
   }
+  ctx.useCanonicalBase();
   const { items, total } = await readAll(ctx, appid);
   const r = recordFullRead(acc, appid, items, total);
   if (r.pending) {
@@ -281,12 +351,22 @@ async function checkApp(ctx: Ctx, appid: number, forceFull: boolean): Promise<'o
   return r.pending && !r.suspicious ? 'confirm' : 'ok';
 }
 
-/** Every page of one game's list. A list that changes while it is read is read again later. */
+/**
+ * Every page of one game's list. A list that changes while it is read is read again later. A list can also
+ * count items it never shows: a small shortfall that is exactly the same on the next read is taken as that,
+ * since refusing it for good would stop the whole list.
+ */
 async function readAll(ctx: Ctx, appid: number): Promise<{ items: SubItem[]; total: number }> {
   const seen = new Map<string, SubItem>();
+  const before = getAccountApp(ctx.acc.id, appid).short_by;
   let total = 0;
   for (let p = 1; ; p++) {
-    const page = await ctx.page(appid, p);
+    let page = await ctx.page(appid, p);
+    if (page.short && !before) {
+      // Steam serves a half-rendered page now and then, and the next load gets it right.
+      await sleep(PAGE_RETRY_MS);
+      page = await ctx.page(appid, p);
+    }
     if (p === 1) total = page.total ?? 0;
     else if (page.total !== null && page.total !== total) {
       throw new SteamError('temporary', `The list of app ${appid} changed while it was read (${total} -> ${page.total} subscriptions)`);
@@ -295,7 +375,13 @@ async function readAll(ctx: Ctx, appid: number): Promise<{ items: SubItem[]; tot
     if (!page.items.length || page.to >= total || p > Math.ceil(total / PAGE_SIZE)) break;
     await sleep(PAGE_GAP_MS);
   }
-  if (seen.size !== total) throw new SteamError('temporary', `Read ${seen.size} of ${total} subscriptions of app ${appid}; reading again later`);
+  const shortBy = total - seen.size;
+  const small = shortBy > 0 && shortBy <= Math.max(3, Math.ceil(total / 100));
+  if (shortBy !== before) q('UPDATE account_apps SET short_by = ? WHERE account_id = ? AND appid = ?').run(small ? shortBy : 0, ctx.acc.id, appid);
+  if (shortBy !== 0 && !(small && shortBy === before)) {
+    throw new SteamError('temporary', `Read ${seen.size} of ${total} subscriptions of app ${appid}; reading again later`);
+  }
+  if (shortBy) addEventOnce(ctx.acc, 'lost', `App ${appid}: Steam counts ${shortBy} subscription(s) it does not list`, DAY);
   return { items: [...seen.values()], total };
 }
 
@@ -305,44 +391,61 @@ async function runWrites(ctx: Ctx): Promise<void> {
   if (!writesAllowed()) return;
   const perRun = numSetting('writes_per_run', 1, 1000);
   const gap = numSetting('write_gap_ms', 0, 60_000);
-  const list = pendingJobWrites(acc.id, perRun);
-  if (list.length < perRun) list.push(...pendingSyncWrites(acc.id, Date.now(), perRun - list.length));
+  const now = Date.now();
+  const list = pendingJobWrites(acc.id, now, perRun);
+  if (list.length < perRun) {
+    // An item leaving the group through a job is also wanted gone by the group: one write does for both.
+    const queued = new Set(list.map((w) => w.id));
+    list.push(...pendingSyncWrites(acc.id, now, perRun - list.length).filter((w) => !queued.has(w.id)));
+  }
   if (!list.length) return;
 
   const done = { subscribe: 0, unsubscribe: 0 };
   const failed: string[] = [];
   const subscribed = new Map<number, PendingWrite[]>();
   let reapplied: PendingWrite[] = [];
+  let outage = 0;
+  let networkError: SteamError | null = null;
   try {
     for (const [i, w] of list.entries()) {
       if (!writesAllowed()) break;
       if (i && gap) await sleep(gap);
+      if (!writeStillWanted(acc.id, w)) continue;
+      const wasPresent = isPresent(acc.id, w.id);
       let result;
       try {
         result = await ctx.write(w);
+        outage = 0;
       } catch (e) {
         // A network error or 5xx on one item gets that item's back-off; it must not block the others.
         if (!(e instanceof SteamError) || e.kind !== 'temporary') throw e;
-        result = { outcome: 'failed' as const, code: '', message: errMsg(e) };
+        networkError = e;
+        outage++;
+        result = { outcome: 'network' as const, code: '', message: errMsg(e) };
       }
-      writeTimes.push(Date.now());
+      syncState.lastBeatAt = Date.now();
+      countWrite(syncState.lastBeatAt);
       if (recordWrite(acc, w, result.outcome, result.message)) reapplied.push(w);
       if (result.outcome === 'ok') {
         done[w.action]++;
-        if (w.action === 'subscribe') subscribed.set(w.appid, [...(subscribed.get(w.appid) ?? []), w]);
+        if (w.action === 'subscribe' && !wasPresent) subscribed.set(w.appid, [...(subscribed.get(w.appid) ?? []), w]);
       } else {
         failed.push(`${w.title || w.id}: ${result.message}`);
       }
+      if (outage >= OUTAGE_WRITES) break;
     }
     // Steam has answered OK for items that then never showed up: check the subscribes on the list itself.
     for (const [appid, ws] of subscribed) {
       const missing = await verifySubscribes(ctx, appid, ws.map((w) => w.id));
       if (missing.length) {
-        failed.push(...ws.filter((w) => missing.includes(w.id)).map((w) => `${w.title || w.id}: accepted by Steam but not on the list`));
+        const notListed = ws.filter((w) => missing.includes(w.id));
+        failJobWrites(acc.id, notListed, 'Steam accepted the subscription, but the item did not show up in the list');
+        failed.push(...notListed.map((w) => `${w.title || w.id}: accepted by Steam but not on the list`));
         reapplied = reapplied.filter((w) => !missing.includes(w.id));
         done.subscribe -= missing.length;
       }
     }
+    if (outage >= OUTAGE_WRITES) throw networkError;
   } finally {
     const parts = [];
     if (done.subscribe) parts.push(`subscribed ${done.subscribe}`);
@@ -400,6 +503,8 @@ function handleFailure(acc: Account, e: unknown, phase: 'login' | 'read' | 'writ
   const s = getSettings();
   const kind = e instanceof SteamError ? e.kind : 'temporary';
   const now = Date.now();
+  if (kind === 'login_throttled' && now >= syncState.loginPausedUntil) noteLoginThrottle();
+  if (kind === 'token_suspect') tokenSuspects.set(acc.id, (tokenSuspects.get(acc.id) ?? 0) + 1);
   let fails = acc.fail_count + 1;
   let status = 'error';
   let backoff = Math.min(15 * MIN, MIN * 2 ** Math.min(fails - 1, 4));
@@ -420,6 +525,7 @@ function handleFailure(acc: Account, e: unknown, phase: 'login' | 'read' | 'writ
     backoff = Math.max(backoff, 5 * MIN);
     syncState.pausedUntil = Math.max(syncState.pausedUntil, now + 2 * MIN);
     if (phase === 'write') syncState.writePausedUntil = Math.max(syncState.writePausedUntil, now + 10 * MIN);
+    savePauses();
   }
 
   log.warn(`${acc.username}: ${status} - ${errMsg(e)}${backoff ? ` (retry in ${Math.round(backoff / 1000)}s)` : ''}`);
@@ -435,6 +541,8 @@ function handleFailure(acc: Account, e: unknown, phase: 'login' | 'read' | 'writ
     status, status_msg: errMsg(e), fail_count: fails, next_attempt_at: backoff ? now + backoff : 0, problem_notified: notified,
     // A broken session also delays the next check, so the account is not hammered.
     ...(SESSION_ERRORS.has(kind) && backoff ? { next_check_at: Math.max(acc.next_check_at, now + backoff) } : {}),
+    // A read that failed for a passing reason is tried again on the back-off, not a full interval later.
+    ...(kind === 'temporary' && phase === 'read' && backoff ? { next_check_at: now + backoff } : {}),
   });
 }
 

@@ -64,14 +64,21 @@ function activeSize(groupId: number): { bytes: number; unsized: number } {
             WHERE gi.group_id = ? AND gi.state = 'active'`).get(groupId) as { bytes: number; unsized: number };
 }
 
-/** Subscriptions of active items that are in place, summed over all members. */
+/** Active items that can actually be subscribed: one gone from Steam never reaches a member. */
+function availableItems(groupId: number): number {
+  return (q(`SELECT COUNT(*) AS n FROM group_items gi JOIN items i ON i.id = gi.item_id
+             JOIN group_apps ga ON ga.group_id = gi.group_id AND ga.appid = i.appid
+             WHERE gi.group_id = ? AND gi.state = 'active' AND i.status = 'ok'`).get(groupId) as { n: number }).n;
+}
+
+/** Subscriptions of available active items that are in place, summed over all members. */
 function syncedCells(groupId: number): number {
   return (q(`SELECT COUNT(*) AS n FROM group_items gi
              JOIN items i ON i.id = gi.item_id
              JOIN group_apps ga ON ga.group_id = gi.group_id AND ga.appid = i.appid
              JOIN group_members gm ON gm.group_id = gi.group_id
              JOIN account_items ai ON ai.account_id = gm.account_id AND ai.item_id = gi.item_id AND ai.present = 1
-             WHERE gi.group_id = ? AND gi.state = 'active'`).get(groupId) as { n: number }).n;
+             WHERE gi.group_id = ? AND gi.state = 'active' AND i.status = 'ok'`).get(groupId) as { n: number }).n;
 }
 
 function memberCount(groupId: number): number {
@@ -84,7 +91,7 @@ export function groupSummaries() {
     const members = memberCount(g.id);
     return {
       id: g.id, name: g.name, state: g.state, created_at: g.created_at, apps: groupApps(g.id), members, items: counts,
-      synced: syncedCells(g.id), cells: counts.active * members, ...activeSize(g.id),
+      synced: syncedCells(g.id), cells: availableItems(g.id) * members, ...activeSize(g.id),
     };
   });
 }
@@ -102,7 +109,7 @@ export function groupDetail(id: number) {
                             JOIN items i ON i.id = gi.item_id
                             JOIN group_apps ga ON ga.group_id = gi.group_id AND ga.appid = i.appid
                             LEFT JOIN account_items ai ON ai.account_id = gm.account_id AND ai.item_id = gi.item_id
-                            WHERE gm.group_id = ? GROUP BY gm.account_id`).all(id) as
+                            WHERE gm.group_id = ? AND i.status = 'ok' GROUP BY gm.account_id`).all(id) as
     { account_id: number; has: number; failing: number; missing_bytes: number }[])
     .map((r) => [r.account_id, r]));
   const apps = groupApps(id);
@@ -118,6 +125,7 @@ export function groupDetail(id: number) {
         has: stats.get(m.id)?.has ?? 0, failing: stats.get(m.id)?.failing ?? 0, missing_bytes: stats.get(m.id)?.missing_bytes ?? 0,
       };
     });
+  const available = availableItems(id);
   return {
     group: {
       id: g.id, name: g.name, state: g.state, created_at: g.created_at, start_requested_at: g.start_requested_at,
@@ -128,7 +136,8 @@ export function groupDetail(id: number) {
     items: counts,
     ...activeSize(id),
     synced: syncedCells(id),
-    cells: counts.active * members.length,
+    available,
+    cells: available * members.length,
     members,
     collections: q('SELECT collection_id, title, child_count, resolved_at, last_error, added_at FROM group_collections WHERE group_id = ? ORDER BY added_at').all(id),
   };

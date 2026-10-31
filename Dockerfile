@@ -15,7 +15,7 @@ COPY public ./public
 VOLUME /data
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+  CMD node -e "process.env.NODE_TLS_REJECT_UNAUTHORIZED='0';fetch((process.env.TLS_CERT_FILE?'https':'http')+'://127.0.0.1:'+(process.env.PORT||8080)+'/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
 LABEL org.opencontainers.image.source="https://github.com/MRACHINI/SteamWorkshopSync" \
       org.opencontainers.image.description="Keeps Steam Workshop subscriptions in sync across groups of Steam accounts"
 CMD ["node", "dist/index.js"]

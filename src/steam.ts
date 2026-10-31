@@ -11,6 +11,7 @@ export type SteamErrorKind =
   | 'login_throttled' // Steam is throttling password logins from this IP
   | 'not_logged_in' // session cookies rejected
   | 'token_invalid' // refresh token rejected
+  | 'token_suspect' // renewing the session failed in a way that may or may not be about the token
   | 'temporary'; // network / 5xx / unexpected page
 
 export class SteamError extends Error {
@@ -74,23 +75,37 @@ export function newLoginSession(): LoginSession {
   return new LoginSession(EAuthTokenPlatformType.WebBrowser, { userAgent: USER_AGENT });
 }
 
+/** steam-session's own requests have no time limit, and one that is never answered must not stall the app. */
+export function withTimeout<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const limit = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new SteamError('temporary', `Network timeout: ${what} took longer than ${ms / 1000} s`)), ms);
+  });
+  return Promise.race([work, limit]).finally(() => clearTimeout(timer));
+}
+
 /** Full username/password login. Only used when there is no valid refresh token. */
 export async function loginWithPassword(username: string, password: string): Promise<Tokens> {
   const session = newLoginSession();
   session.loginTimeout = 30_000;
   try {
-    const start = await session.startWithCredentials({ accountName: username, password });
+    const start = await withTimeout(session.startWithCredentials({ accountName: username, password }), 30_000, 'the login');
     if (start.actionRequired) {
       session.cancelLoginAttempt();
       throw new SteamError('needs_guard', 'Steam Guard is on for this account. Sign it in from the web UI.');
     }
-    await new Promise<void>((resolve, reject) => {
+    await withTimeout(new Promise<void>((resolve, reject) => {
       session.once('authenticated', () => resolve());
       session.once('timeout', () => reject(new SteamError('temporary', 'Login timed out')));
       session.once('error', (err) => reject(err));
-    });
+    }), 60_000, 'the login');
     return { steamid: session.steamID.getSteamID64(), refreshToken: session.refreshToken };
   } catch (e) {
+    try {
+      session.cancelLoginAttempt();
+    } catch {
+      // never got that far
+    }
     throw mapEresult(e);
   }
 }
@@ -132,6 +147,15 @@ async function drain(res: Response): Promise<void> {
   await res.arrayBuffer().catch(() => undefined);
 }
 
+/** The body of a response. A connection can still drop after the headers arrived. */
+async function bodyText(res: Response): Promise<string> {
+  try {
+    return await res.text();
+  } catch (e) {
+    throw new SteamError('temporary', `Network error: ${(e as Error).message}`);
+  }
+}
+
 function pickCookie(res: Response, name: string): string | null {
   for (const c of res.headers.getSetCookie()) {
     const m = c.match(new RegExp(`^${name}=([^;]+)`));
@@ -145,8 +169,12 @@ export const profileBase = (steamid: string) => `https://steamcommunity.com/prof
 /**
  * Trade the long-lived refresh token for a fresh steamcommunity.com session cookie.
  * Same flow a real browser runs: login.steampowered.com/jwt/refresh -> steamcommunity.com/login/settoken.
+ * A token Steam rotates along the way goes to onRotated right away: the old one may stop working, so it has to
+ * be saved even if the next step fails.
  */
-export async function refreshCookies(tokens: Tokens, timeoutMs: number): Promise<{ cookies: string; refreshToken: string }> {
+export async function refreshCookies(
+  tokens: Tokens, timeoutMs: number, onRotated?: (refreshToken: string) => void,
+): Promise<{ cookies: string; refreshToken: string }> {
   const refreshCookie = `steamRefresh_steam=${tokens.steamid}%7C%7C${tokens.refreshToken}`;
   const redir = `${profileBase(tokens.steamid)}myworkshopfiles/`;
   const res = await http(`https://login.steampowered.com/jwt/refresh?redir=${encodeURIComponent(redir)}`, { cookie: refreshCookie, timeoutMs });
@@ -154,40 +182,41 @@ export async function refreshCookies(tokens: Tokens, timeoutMs: number): Promise
   await drain(res);
   const location = res.headers.get('location') ?? '';
   if (!location.includes('/login/settoken')) {
-    return refreshCookiesFallback(tokens);
+    return refreshCookiesFallback(tokens, timeoutMs);
   }
   // Steam may rotate the refresh token here.
   const rotated = pickCookie(res, 'steamRefresh_steam');
   const newRefresh = rotated ? decodeURIComponent(rotated).split('||')[1] || tokens.refreshToken : tokens.refreshToken;
+  if (newRefresh !== tokens.refreshToken) onRotated?.(newRefresh);
 
   const res2 = await http(location, { timeoutMs });
   checkStatus(res2);
   await drain(res2);
   const loginSecure = pickCookie(res2, 'steamLoginSecure');
-  if (!loginSecure) return refreshCookiesFallback(tokens);
+  if (!loginSecure) return refreshCookiesFallback({ steamid: tokens.steamid, refreshToken: newRefresh }, timeoutMs);
   // Steam accepts any sessionid as long as the cookie and the form field match (double-submit CSRF).
   const sessionid = crypto.randomBytes(12).toString('hex');
   return { cookies: `steamLoginSecure=${loginSecure}; sessionid=${sessionid}`, refreshToken: newRefresh };
 }
 
-async function refreshCookiesFallback(tokens: Tokens): Promise<{ cookies: string; refreshToken: string }> {
+async function refreshCookiesFallback(tokens: Tokens, timeoutMs: number): Promise<{ cookies: string; refreshToken: string }> {
   try {
     const session = newLoginSession();
     session.refreshToken = tokens.refreshToken;
-    const all = await session.getWebCookies();
+    const all = await withTimeout(session.getWebCookies(), timeoutMs, 'renewing the session');
     const wanted = all
       .filter((c) => /domain=steamcommunity\.com/i.test(c) || !/domain=/i.test(c))
       .map((c) => c.split(';')[0]);
     if (!wanted.some((c) => c.startsWith('steamLoginSecure='))) {
-      throw new SteamError('token_invalid', 'No steamcommunity.com session cookie returned');
+      throw new SteamError('token_suspect', 'No steamcommunity.com session cookie returned');
     }
     return { cookies: [...new Set(wanted)].join('; '), refreshToken: tokens.refreshToken };
   } catch (e) {
     const mapped = mapEresult(e);
-    // Anything that is not clearly transient means the token is unusable.
-    if (mapped.kind === 'temporary' && !/network|timeout|ECONN|ENOTFOUND|HTTP error 5/i.test(mapped.message)) {
-      throw new SteamError('token_invalid', mapped.message);
-    }
+    // Steam having a bad moment looks the same as a dead token here, and a valid sign-in must not be thrown
+    // away over it. Only Steam's own answer proves a token dead; anything unclear counts against it if it lasts.
+    const transient = /network|time[d ]?\s?out|ECONN|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|socket hang up|HTTP error/i;
+    if (mapped.kind === 'temporary' && !transient.test(mapped.message)) throw new SteamError('token_suspect', mapped.message);
     throw mapped;
   }
 }
@@ -217,6 +246,8 @@ export interface SubsPage {
   from: number;
   to: number;
   items: SubItem[];
+  /** The page lists fewer entries than its paging line promises. */
+  short: boolean;
 }
 
 export const subsUrl = (base: string, appid: number, page: number) =>
@@ -239,17 +270,17 @@ export function parseSubsPage(html: string, steamid: string): SubsPage {
   if (items.some((i) => !/^\d+$/.test(i.id))) throw new SteamError('temporary', 'Unreadable item id on the subscriptions page');
   if (!items.length) {
     // The empty list and a page past the end both show this message.
-    if ($('#no_items').length) return { total: null, from: 0, to: 0, items: [] };
+    if ($('#no_items').length) return { total: null, from: 0, to: 0, items: [], short: false };
     throw new SteamError('temporary', 'Subscriptions page shows neither items nor the empty-list message');
   }
   // "Showing 1-30 of 2,013 entries": read the three numbers, whatever the wording around them.
   const nums = ($('.workshopBrowsePagingInfo').first().text().match(/\d[\d,.]*/g) ?? []).map((n) => Number(n.replace(/[,.]/g, '')));
   if (nums.length < 3) throw new SteamError('temporary', 'Paging information missing from the subscriptions page');
   const [from, to, total] = nums;
-  if (to - from + 1 !== items.length || total < to) {
-    throw new SteamError('temporary', `Half-rendered subscriptions page (${items.length} entries for ${from}-${to} of ${total})`);
+  if (to - from + 1 < items.length || total < to) {
+    throw new SteamError('temporary', `Unreadable subscriptions page (${items.length} entries for ${from}-${to} of ${total})`);
   }
-  return { total, from, to, items };
+  return { total, from, to, items, short: items.length < to - from + 1 };
 }
 
 /**
@@ -278,7 +309,7 @@ export async function fetchSubsPage(
       if (res) await drain(res);
       throw new SteamError('temporary', `Subscriptions page returned HTTP ${res?.status}`);
     }
-    const parsed = parseSubsPage(await res.text(), steamid);
+    const parsed = parseSubsPage(await bodyText(res), steamid);
     return { page: parsed, base: url.slice(0, url.indexOf('myworkshopfiles')) };
   };
   const canonical = profileBase(steamid);
@@ -368,7 +399,7 @@ export async function setSubscription(
     throw new SteamError('not_logged_in', `The ${action} was redirected to ${res.headers.get('location') ?? 'elsewhere'}`);
   }
   checkStatus(res);
-  const text = await res.text();
+  const text = await bodyText(res);
   if (res.status !== 200) throw new SteamError('temporary', `The ${action} returned HTTP ${res.status}`);
   let success: unknown;
   try {

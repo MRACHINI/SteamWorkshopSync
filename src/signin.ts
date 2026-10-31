@@ -5,12 +5,12 @@ import { encrypt } from './crypto.js';
 import { addEvent, getAccount, updateAccount } from './db.js';
 import { errMsg, log } from './log.js';
 import { requestCheck } from './scheduler.js';
-import { jwtExpiresAt, mapEresult, newLoginSession } from './steam.js';
+import { jwtExpiresAt, mapEresult, newLoginSession, withTimeout } from './steam.js';
 
 /**
  * Interactive sign-in from the web UI, for accounts with Steam Guard (the main account): a QR code for the
  * Steam mobile app, or the password plus an emailed / mobile code. Only the resulting long-lived sign-in is
- * kept; the password is stored only when the admin ticks "remember".
+ * kept; the password is stored only when the admin ticks "remember", and never for the main account.
  */
 export type SigninState = 'starting' | 'waiting_scan' | 'scanned' | 'need_code' | 'need_confirm' | 'done' | 'failed';
 
@@ -30,6 +30,8 @@ interface Signin {
 
 const signins = new Map<string, Signin>();
 const TTL_MS = 5 * 60_000;
+/** Steam's answer to a single sign-in step. */
+const STEP_TIMEOUT_MS = 30_000;
 
 setInterval(() => {
   for (const [id, s] of signins) {
@@ -72,7 +74,7 @@ async function finish(s: Signin): Promise<void> {
     updateAccount(acc.id, {
       steamid, refresh_token_enc: encrypt(token), cookies_enc: null, token_expires_at: jwtExpiresAt(token), token_warned: 0,
       interactive: s.interactive ? 1 : 0, status: 'new', status_msg: '', fail_count: 0, next_attempt_at: 0, next_check_at: 0,
-      problem_notified: 0, ...(s.remember && s.password ? { password_enc: encrypt(s.password) } : {}),
+      problem_notified: 0, ...(s.remember && s.password && !acc.is_main ? { password_enc: encrypt(s.password) } : {}),
     });
     s.state = 'done';
     s.message = name || acc.steamid ? 'Signed in.' : 'Signed in. The account name could not be checked: make sure it was the right account.';
@@ -115,13 +117,21 @@ export function publicSignin(s: Signin) {
   return { id: s.id, state: s.state, message: s.message, qrSvg: s.qrSvg, codeType: s.codeType };
 }
 
+const qrSvg = (url: string) => QRCode.toString(url, { type: 'svg', margin: 1, width: 240 });
+
 export async function startQrSignin(accountId: number) {
   if (!getAccount(accountId)) throw new Error('not found');
   const session = newLoginSession();
   const s = track(accountId, session, {});
+  // Steam replaces the challenge while the code is on screen. steam-session only passes the new one to its
+  // debug event; the old code stops being watched, so the page has to show the new one.
+  (session as unknown as NodeJS.EventEmitter).on('debug', (what: string, poll?: { newChallengeUrl?: string }) => {
+    if (what !== 'poll response' || !poll?.newChallengeUrl) return;
+    qrSvg(poll.newChallengeUrl).then((svg) => (s.qrSvg = svg), (e) => log.warn(`QR code refresh failed: ${errMsg(e)}`));
+  });
   try {
-    const start = await session.startWithQR();
-    s.qrSvg = await QRCode.toString(start.qrChallengeUrl ?? '', { type: 'svg', margin: 1, width: 240 });
+    const start = await withTimeout(session.startWithQR(), STEP_TIMEOUT_MS, 'Steam');
+    s.qrSvg = await qrSvg(start.qrChallengeUrl ?? '');
     s.state = 'waiting_scan';
     s.message = 'In the Steam mobile app, open Steam Guard and scan this code.';
   } catch (e) {
@@ -136,7 +146,7 @@ export async function startPasswordSignin(accountId: number, password: string, r
   const session = newLoginSession();
   const s = track(accountId, session, { password, remember, interactive: false, message: 'Signing in…' });
   try {
-    const start = await session.startWithCredentials({ accountName: acc.username, password });
+    const start = await withTimeout(session.startWithCredentials({ accountName: acc.username, password }), STEP_TIMEOUT_MS, 'Steam');
     if (start.actionRequired) {
       s.interactive = true;
       const actions = start.validActions ?? [];
@@ -168,12 +178,16 @@ export async function submitSigninCode(id: string, code: string) {
   if (!s) throw new Error('This sign-in has expired. Start again.');
   if (s.state !== 'need_code') return publicSignin(s);
   try {
-    await s.session.submitSteamGuardCode(code.trim());
+    await withTimeout(s.session.submitSteamGuardCode(code.trim()), STEP_TIMEOUT_MS, 'Steam');
     s.message = 'Code accepted, finishing…';
   } catch (e) {
     const eresult = (e as { eresult?: number }).eresult;
     if (eresult === EResult.InvalidLoginAuthCode || eresult === EResult.TwoFactorCodeMismatch) {
       s.message = 'That code was not accepted. Try again with a new code.';
+    } else if (eresult === EResult.Expired) {
+      s.message = 'That code has expired. Try again with a new code.';
+    } else if (eresult === EResult.DuplicateRequest) {
+      s.message = 'Steam already has this sign-in. Finishing…'; // approved on the phone just before the code arrived
     } else {
       fail(s, mapEresult(e).message);
     }

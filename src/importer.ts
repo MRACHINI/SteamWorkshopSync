@@ -14,7 +14,7 @@ export interface ImportAccount {
  *   username:password                      one per line, everything after the first ':' is the password
  */
 export function parseImportText(input: string): ImportAccount[] {
-  const text = input.trim();
+  const text = input.trimStart();
   if (text.startsWith('[')) {
     const items = JSON.parse(text) as Partial<ImportAccount>[];
     return items.map((it) => ({ username: String(it.username ?? ''), password: String(it.password ?? ''), note: it.note }));
@@ -23,7 +23,7 @@ export function parseImportText(input: string): ImportAccount[] {
     .split(/\r?\n/)
     .filter((l) => l.trim())
     .map((line, i) => {
-      const l = line.trim();
+      const l = line.trimStart();
       if (l.includes('\t')) {
         const [username, password = '', ...rest] = l.split('\t');
         return { username: username.trim(), password, note: rest.join(' ').trim() };
@@ -36,17 +36,18 @@ export function parseImportText(input: string): ImportAccount[] {
 
 /**
  * Insert or update an account. Without a password the account is signed in from the web UI instead
- * (Steam Guard accounts). Returns 'added' | 'updated'.
+ * (Steam Guard accounts). The main account's password is never stored. Returns 'added' | 'updated'.
  */
 export function upsertAccount(a: { username: string; password?: string; note?: string }): 'added' | 'updated' {
   const username = a.username.trim();
   if (!username) throw new Error('username is required');
   if (!/^[A-Za-z0-9_]{1,64}$/.test(username)) throw new Error(`"${username}" is not a Steam account name (letters, digits and _ only)`);
   const existing = getAccountByName(username);
+  if (existing?.is_main && a.password) throw new Error(`${username} is the main account: its password is never stored. Sign it in from the web UI.`);
   if (existing) {
     updateAccount(existing.id, {
       ...(a.password ? { password_enc: encrypt(a.password), status: 'new', status_msg: '', fail_count: 0, next_attempt_at: 0, problem_notified: 0 } : {}),
-      note: a.note ?? existing.note,
+      note: a.note || existing.note, // a blank note means none was given (clearing one is what Edit is for)
     });
     return 'updated';
   }

@@ -5,8 +5,19 @@ import { errMsg, log } from './log.js';
 import { note, noteApproval, noteHeld } from './notify.js';
 import { FILETYPE_COLLECTION, type ItemDetails, type SubItem, fetchCollections, fetchItemDetails } from './steam.js';
 
-const HOUR = 3600_000;
+const MIN = 60_000;
+const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
+/** Losses on the main account within this time count as one removal for the hold threshold. */
+const HOLD_WINDOW = HOUR;
+/** Steam's list may show an item for a moment after it was unsubscribed. */
+const UNSUBSCRIBE_LAG = 10 * MIN;
+/** A job's write that hit a network error is tried this many times before it counts as failed. */
+const JOB_ATTEMPTS = 8;
+// account_items.removal_held
+const HELD = 1;
+/** Lost by the main account during a run still in progress: see settleMainRemovals. */
+const UNDECIDED = 2;
 
 export interface Group {
   id: number;
@@ -131,6 +142,8 @@ export interface AccountApp {
   last_check_at: number | null;
   last_full_at: number;
   full_due: number;
+  /** How many subscriptions the list counted but did not show on its last full read. */
+  short_by: number;
 }
 
 export function getAccountApp(accountId: number, appid: number): AccountApp {
@@ -143,6 +156,13 @@ export function presentSet(accountId: number, appid: number): Set<string> {
   const rows = q(`SELECT ai.item_id FROM account_items ai JOIN items i ON i.id = ai.item_id
                   WHERE ai.account_id = ? AND i.appid = ? AND ai.present = 1`).all(accountId, appid) as { item_id: string }[];
   return new Set(rows.map((r) => r.item_id));
+}
+
+/** Items that are on this account of its own accord, not because this app subscribed them. */
+function ownItems(accountId: number, appid: number): string[] {
+  return (q(`SELECT ai.item_id FROM account_items ai JOIN items i ON i.id = ai.item_id
+             WHERE ai.account_id = ? AND i.appid = ? AND ai.present = 1 AND ai.added_by = ''`).all(accountId, appid) as { item_id: string }[])
+    .map((r) => r.item_id);
 }
 
 /** True while an item missed on the last full read still waits for the confirming second read. */
@@ -163,6 +183,21 @@ function markPresent(accountId: number, appid: number, items: SubItem[], now: nu
   }
 }
 
+/** What a read shows, minus items this app unsubscribed moments ago: those have not been picked up again. */
+function withoutLagging(accountId: number, items: SubItem[], now: number): SubItem[] {
+  if (!items.length) return items;
+  const recent = new Set((q('SELECT item_id FROM account_items WHERE account_id = ? AND unsubscribed_at > ?')
+    .all(accountId, now - UNSUBSCRIBE_LAG) as { item_id: string }[]).map((r) => r.item_id));
+  return recent.size ? items.filter((i) => !recent.has(i.id)) : items;
+}
+
+/** A subscribe Steam accepted but no list ever showed is a failed write: retried later, never a lost item. */
+function failUnlisted(accountId: number, itemId: string, fails: number, now: number): void {
+  q(`UPDATE account_items SET present = 0, missing_count = 0, write_error = ?, write_fails = ?, write_next_at = ?, updated_at = ?
+     WHERE account_id = ? AND item_id = ?`)
+    .run('Steam accepted the subscription, but the item did not show up in the list', fails, now + Math.min(DAY, HOUR * 2 ** Math.min(fails - 1, 5)), now, accountId, itemId);
+}
+
 export interface FullReadResult {
   added: number;
   lost: number;
@@ -174,11 +209,14 @@ export interface FullReadResult {
 /**
  * A full read of one game's list. Items missing from it count as gone only on the second full read in a row
  * (the third, spaced at the normal interval, when most of the list vanished at once), so a bad read can never
- * trigger re-subscribes or removals.
+ * trigger re-subscribes or removals. What a list shows on its first read was there all along, so it only
+ * brings in items the group never had: it does not undo a removal.
  */
-export function recordFullRead(acc: Account, appid: number, items: SubItem[], total: number): FullReadResult {
+export function recordFullRead(acc: Account, appid: number, shown: SubItem[], total: number): FullReadResult {
   return tx(() => {
     const now = Date.now();
+    const firstRead = !getAccountApp(acc.id, appid).initialized;
+    const items = withoutLagging(acc.id, shown, now);
     const before = presentSet(acc.id, appid);
     const seen = new Set(items.map((i) => i.id));
     const dropped = [...before].filter((id) => !seen.has(id)).length;
@@ -190,7 +228,13 @@ export function recordFullRead(acc: Account, appid: number, items: SubItem[], to
     let pending = 0;
     for (const id of before) {
       if (seen.has(id)) continue;
-      const row = q('SELECT missing_count FROM account_items WHERE account_id = ? AND item_id = ?').get(acc.id, id) as { missing_count: number };
+      const row = q('SELECT missing_count, written_at, seen_at, write_fails FROM account_items WHERE account_id = ? AND item_id = ?').get(acc.id, id) as
+        { missing_count: number; written_at: number | null; seen_at: number | null; write_fails: number };
+      // Written by this app, and no read has shown it since (the run that wrote it may not have got to verify it).
+      if (row.written_at && (row.seen_at ?? 0) < row.written_at) {
+        failUnlisted(acc.id, id, row.write_fails + 1, now);
+        continue;
+      }
       if (row.missing_count + 1 >= needed) {
         q('UPDATE account_items SET present = 0, missing_count = 0, lost_at = ?, updated_at = ? WHERE account_id = ? AND item_id = ?')
           .run(now, now, acc.id, id);
@@ -202,8 +246,8 @@ export function recordFullRead(acc: Account, appid: number, items: SubItem[], to
     }
     q(`UPDATE account_apps SET initialized = 1, last_total = ?, last_full_at = ?, last_check_at = ?, full_due = ?
        WHERE account_id = ? AND appid = ?`).run(total, now, now, pending ? 1 : 0, acc.id, appid);
-    onItemsAppeared(acc, appid, added);
-    onItemsLost(acc, appid, lost, total === 0);
+    onItemsAppeared(acc, appid, added, firstRead);
+    onItemsLost(acc, appid, lost, total > shown.length);
     return { added: added.length, lost: lost.length, pending, suspicious };
   });
 }
@@ -225,10 +269,7 @@ export function recordVerified(acc: Account, appid: number, written: string[], s
       const row = q('SELECT present, write_fails FROM account_items WHERE account_id = ? AND item_id = ?').get(acc.id, id) as
         { present: number; write_fails: number } | undefined;
       if (!row?.present) continue;
-      const fails = row.write_fails + 1;
-      q(`UPDATE account_items SET present = 0, write_error = ?, write_fails = ?, write_next_at = ?, updated_at = ?
-         WHERE account_id = ? AND item_id = ?`)
-        .run('Steam accepted the subscription, but the item did not show up in the list', fails, now + Math.min(DAY, HOUR * 2 ** Math.min(fails - 1, 5)), now, acc.id, id);
+      failUnlisted(acc.id, id, row.write_fails + 1, now);
       q('UPDATE account_apps SET last_total = MAX(0, last_total - 1) WHERE account_id = ? AND appid = ?').run(acc.id, appid);
       missing.push(id);
     }
@@ -239,8 +280,9 @@ export function recordVerified(acc: Account, appid: number, written: string[], s
 /**
  * Shares what accounts already have for these games with their groups, as if it had just appeared: used when
  * an account joins a running group, a running group adds a game, or a group resumes. Only items the group has
- * never had are added (a removed item an account kept for another group stays removed). Lists not read yet
- * are shared on their first read anyway.
+ * never had are added (a removed item an account kept for another group stays removed), and only ones the
+ * account picked up itself: what this app gave it came from another group, and stays that group's business.
+ * Lists not read yet are shared on their first read anyway.
  */
 export function shareExisting(accountIds: number[], appids: number[]): void {
   for (const accountId of accountIds) {
@@ -248,15 +290,16 @@ export function shareExisting(accountIds: number[], appids: number[]): void {
     if (!acc) continue;
     for (const appid of appids) {
       const st = q('SELECT initialized FROM account_apps WHERE account_id = ? AND appid = ?').get(accountId, appid) as { initialized: number } | undefined;
-      if (st?.initialized) onItemsAppeared(acc, appid, [...presentSet(accountId, appid)], true);
+      if (st?.initialized) onItemsAppeared(acc, appid, ownItems(accountId, appid), true);
     }
   }
 }
 
 /** A quick read: only the newest page(s), when the total shows nothing disappeared. */
-export function recordQuickRead(acc: Account, appid: number, fresh: SubItem[], total: number): void {
+export function recordQuickRead(acc: Account, appid: number, shown: SubItem[], total: number): void {
   tx(() => {
     const now = Date.now();
+    const fresh = withoutLagging(acc.id, shown, now);
     markPresent(acc.id, appid, fresh, now);
     q('UPDATE account_apps SET last_total = ?, last_check_at = ? WHERE account_id = ? AND appid = ?').run(total, now, acc.id, appid);
     onItemsAppeared(acc, appid, fresh.map((i) => i.id));
@@ -268,9 +311,9 @@ export function recordQuickRead(acc: Account, appid: number, fresh: SubItem[], t
  * onlyNew: only items the groups never had (for items already on the account, not just picked up).
  */
 function onItemsAppeared(acc: Account, appid: number, ids: string[], onlyNew = false): void {
-  if (!ids.length) return;
-  const groups = activeGroupsFor(acc.id, appid);
-  if (!groups.length) return;
+  if (!ids.length || !activeGroupsFor(acc.id, appid).length) return;
+  // A paused group that shares the game is still offered the main account's new items.
+  const groups = acc.is_main ? syncingGroupsFor(acc.id, appid) : activeGroupsFor(acc.id, appid);
 
   const addedTo = new Map<number, string[]>();
   const add = (g: Group, id: string, source: string) => {
@@ -328,9 +371,10 @@ function onItemsAppeared(acc: Account, appid: number, ids: string[], onlyNew = f
 
 /**
  * Subscriptions confirmed gone. On a member they come back by themselves; on the main account they are
- * removals (held for approval when many go at once, or when the whole list emptied).
+ * removals, decided by settleMainRemovals once all its lists were read. A list that counts more than it shows
+ * proves nothing on the main account: Steam may be hiding the item, so that goes to the admin.
  */
-function onItemsLost(acc: Account, appid: number, ids: string[], listEmpty: boolean): void {
+function onItemsLost(acc: Account, appid: number, ids: string[], listShort: boolean): void {
   if (!ids.length) return;
   const groups = acc.is_main ? syncingGroupsFor(acc.id, appid) : activeGroupsFor(acc.id, appid);
   const activeIn = (id: string) => groups.filter((g) => groupItemState(g.id, id) === 'active');
@@ -342,17 +386,58 @@ function onItemsLost(acc: Account, appid: number, ids: string[], listEmpty: bool
   }
   // A pick still waiting for an item the main account no longer has would subscribe it again.
   for (const id of ids) q("DELETE FROM approvals WHERE item_id = ? AND status = 'pending'").run(id);
-  if (!synced.length) return;
-  const threshold = numSetting('removal_hold_threshold', 0, 1_000_000);
-  if (synced.length > threshold || listEmpty) {
-    for (const id of synced) q('UPDATE account_items SET removal_held = 1 WHERE account_id = ? AND item_id = ?').run(acc.id, id);
+  if (listShort) {
+    const reason = 'Steam still counts it on the list, but no longer shows it';
+    for (const id of synced) q('UPDATE account_items SET removal_held = ?, held_reason = ? WHERE account_id = ? AND item_id = ?').run(HELD, reason, acc.id, id);
     const labels = synced.map(itemLabel);
-    addEvent(acc, 'removal_held', `${synced.length} synced item(s) disappeared from the main account${listEmpty ? ', leaving its list empty' : ' at once'}. ` +
+    addEvent(acc, 'removal_held', `${synced.length} synced item(s) no longer shown on the main account's list, though Steam still counts them. ` +
       `Waiting for approval before removing them from the members: ${shortList(labels)}`, true);
     noteHeld(acc.username, labels);
     return;
   }
-  removeFromGroups(acc, synced);
+  // Counted as held until decided, so a crash before that leaves them waiting for the admin, not removed.
+  for (const id of synced) q('UPDATE account_items SET removal_held = ? WHERE account_id = ? AND item_id = ?').run(UNDECIDED, acc.id, id);
+}
+
+/**
+ * Decides what the main account lost: removed from the members, or held for approval when too many went at
+ * once or a whole list emptied. Runs after all its lists were read, because "at once" is not one game or one
+ * read: items still waiting for their confirming read, and ones lost in the last hour, count too.
+ */
+export function settleMainRemovals(): void {
+  const main = getMainAccount();
+  if (!main) return;
+  tx(() => {
+    const undecided = q(`SELECT ai.item_id, aa.last_total FROM account_items ai JOIN items i ON i.id = ai.item_id
+                         LEFT JOIN account_apps aa ON aa.account_id = ai.account_id AND aa.appid = i.appid
+                         WHERE ai.account_id = ? AND ai.removal_held = ?`).all(main.id, UNDECIDED) as { item_id: string; last_total: number | null }[];
+    if (!undecided.length) return;
+    const ids = undecided.map((r) => r.item_id);
+    const alsoGoing = (q(`SELECT COUNT(*) AS n FROM account_items ai
+                          WHERE ai.account_id = ? AND ai.removal_held != ?
+                            AND ((ai.present = 1 AND ai.missing_count > 0) OR (ai.present = 0 AND ai.lost_at > ?))
+                            AND EXISTS (SELECT 1 FROM group_items gi WHERE gi.item_id = ai.item_id AND gi.state != 'blocked')`)
+      .get(main.id, UNDECIDED, Date.now() - HOLD_WINDOW) as { n: number }).n;
+    const listEmpty = undecided.some((r) => r.last_total === 0);
+    if (ids.length + alsoGoing <= numSetting('removal_hold_threshold', 0, 1_000_000) && !listEmpty) {
+      for (const id of ids) q('UPDATE account_items SET removal_held = 0 WHERE account_id = ? AND item_id = ?').run(main.id, id);
+      removeFromGroups(main, ids);
+      return;
+    }
+    for (const id of ids) q('UPDATE account_items SET removal_held = ? WHERE account_id = ? AND item_id = ?').run(HELD, main.id, id);
+    const labels = ids.map(itemLabel);
+    addEvent(main, 'removal_held', `${ids.length} synced item(s) disappeared from the main account${listEmpty ? ', leaving a list empty' : ' at once'}. ` +
+      `Waiting for approval before removing them from the members: ${shortList(labels)}`, true);
+    noteHeld(main.username, labels);
+  });
+}
+
+/** Steam refused the main account an item: its members lose it too, but only once the admin approves. */
+function holdRefused(main: Account, itemId: string, message: string, now: number): void {
+  q('UPDATE account_items SET removal_held = ?, held_reason = ?, lost_at = ? WHERE account_id = ? AND item_id = ?').run(HELD, message, now, main.id, itemId);
+  const label = itemLabel(itemId);
+  addEvent(main, 'removal_held', `${label}: ${message}. Waiting for approval before removing it from the members`, true);
+  noteHeld(main.username, [label]);
 }
 
 /** The main account dropped these items: every group that syncs them (paused ones too) unsubscribes its members. */
@@ -378,15 +463,16 @@ function removeFromGroups(main: Account, ids: string[]): void {
 // Desired state and writes
 // ---------------------------------------------------------------------------
 // What every member should have: an item active in any of its active groups is wanted; blocked or being
-// removed (and active nowhere) is unwanted. Only items of the group's games count.
+// removed (and active nowhere) is unwanted. Only items of the group's games are wanted, but an item being
+// removed or blocked still goes after its game has left the group: the admin asked for that.
 const WANT = `
   SELECT gm.account_id, gi.item_id, i.appid,
-         MAX(gi.state = 'active') AS sub,
+         MAX(gi.state = 'active' AND ga.appid IS NOT NULL) AS sub,
          MAX(gi.state IN ('blocked', 'removing')) AS unsub
   FROM group_items gi
   JOIN groups g ON g.id = gi.group_id AND g.state = 'active'
   JOIN items i ON i.id = gi.item_id
-  JOIN group_apps ga ON ga.group_id = gi.group_id AND ga.appid = i.appid
+  LEFT JOIN group_apps ga ON ga.group_id = gi.group_id AND ga.appid = i.appid
   JOIN group_members gm ON gm.group_id = gi.group_id
   WHERE gi.state != 'removed' %FILTER%
   GROUP BY gm.account_id, gi.item_id`;
@@ -405,12 +491,12 @@ export interface PendingWrite {
   lostAt?: number | null;
 }
 
-export function pendingJobWrites(accountId: number, limit: number): PendingWrite[] {
+export function pendingJobWrites(accountId: number, now: number, limit: number): PendingWrite[] {
   const rows = q(`SELECT ji.job_id, ji.item_id, i.appid, i.title, j.action FROM job_items ji
                   JOIN jobs j ON j.id = ji.job_id AND j.status = 'running'
                   JOIN items i ON i.id = ji.item_id
-                  WHERE ji.account_id = ? AND ji.state = 'pending' ORDER BY ji.job_id, ji.item_id LIMIT ?`)
-    .all(accountId, limit) as { job_id: number; item_id: string; appid: number; title: string; action: 'subscribe' | 'unsubscribe' }[];
+                  WHERE ji.account_id = ? AND ji.state = 'pending' AND ji.next_at <= ? ORDER BY ji.job_id, ji.item_id LIMIT ?`)
+    .all(accountId, now, limit) as { job_id: number; item_id: string; appid: number; title: string; action: 'subscribe' | 'unsubscribe' }[];
   return rows.map((r) => ({ id: r.item_id, appid: r.appid, title: r.title, action: r.action, jobId: r.job_id }));
 }
 
@@ -427,7 +513,23 @@ export function pendingSyncWrites(accountId: number, now: number, limit: number)
 }
 
 export function hasPendingWrites(accountId: number, now: number): boolean {
-  return pendingJobWrites(accountId, 1).length > 0 || pendingSyncWrites(accountId, now, 1).length > 0;
+  return pendingJobWrites(accountId, now, 1).length > 0 || pendingSyncWrites(accountId, now, 1).length > 0;
+}
+
+/** Checked just before each write: the admin may have paused the group, blocked the item or cancelled the job since the list was built. */
+export function writeStillWanted(accountId: number, w: PendingWrite): boolean {
+  if (w.jobId) {
+    return !!q(`SELECT 1 FROM job_items ji JOIN jobs j ON j.id = ji.job_id AND j.status = 'running'
+                WHERE ji.job_id = ? AND ji.account_id = ? AND ji.item_id = ? AND ji.state = 'pending'`).get(w.jobId, accountId, w.id);
+  }
+  return !!q(`WITH w AS (${WANT.replace('%FILTER%', 'AND gm.account_id = ? AND gi.item_id = ?')})
+              SELECT 1 FROM w JOIN items i ON i.id = w.item_id
+              LEFT JOIN account_items ai ON ai.account_id = w.account_id AND ai.item_id = w.item_id
+              WHERE ${NEEDED}`).get(accountId, w.id);
+}
+
+export function isPresent(accountId: number, itemId: string): boolean {
+  return !!q('SELECT 1 FROM account_items WHERE account_id = ? AND item_id = ? AND present = 1').get(accountId, itemId);
 }
 
 export interface PendingCount {
@@ -469,7 +571,7 @@ export function pendingCounts(): Map<number, PendingCount> {
  * total, so the next quick read of that list still adds up. Returns true for a successful re-subscribe.
  */
 export function recordWrite(
-  acc: Account, w: PendingWrite, outcome: 'ok' | 'not_found' | 'denied' | 'failed', message: string,
+  acc: Account, w: PendingWrite, outcome: 'ok' | 'not_found' | 'denied' | 'failed' | 'network', message: string,
 ): boolean {
   return tx(() => {
     const now = Date.now();
@@ -479,54 +581,84 @@ export function recordWrite(
     let reapplied = false;
     if (outcome === 'ok') {
       const sub = w.action === 'subscribe';
-      q(`INSERT INTO account_items (account_id, item_id, present, added_by, written_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+      // An item already on the list was not put there by this write, and needs no proof that it shows up.
+      q(`INSERT INTO account_items (account_id, item_id, present, added_by, written_at, unsubscribed_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(account_id, item_id) DO UPDATE SET present = excluded.present, missing_count = 0,
-           added_by = CASE WHEN excluded.present = 1 THEN excluded.added_by ELSE account_items.added_by END,
-           written_at = CASE WHEN excluded.present = 1 THEN excluded.written_at ELSE account_items.written_at END,
-           write_error = '', write_fails = 0, write_next_at = 0, removal_held = 0,
+           added_by = CASE WHEN excluded.present = 1 AND account_items.present = 0 THEN excluded.added_by ELSE account_items.added_by END,
+           written_at = CASE WHEN excluded.present = 1 AND account_items.present = 0 THEN excluded.written_at ELSE account_items.written_at END,
+           unsubscribed_at = excluded.unsubscribed_at,
+           write_error = '', write_fails = 0, write_next_at = 0, removal_held = 0, held_reason = '',
            lost_at = CASE WHEN excluded.present = 1 THEN NULL ELSE account_items.lost_at END,
            updated_at = excluded.updated_at`)
-        .run(acc.id, w.id, sub ? 1 : 0, w.jobId ? 'job' : 'sync', sub ? now : null, now);
+        .run(acc.id, w.id, sub ? 1 : 0, w.jobId ? 'job' : 'sync', sub ? now : null, sub ? null : now, now);
       if (sub !== wasPresent) {
         q(`UPDATE account_apps SET last_total = MAX(0, last_total + ?) WHERE account_id = ? AND appid = ?`).run(sub ? 1 : -1, acc.id, w.appid);
       }
       reapplied = sub && !w.jobId && !!w.lostAt;
-    } else {
+    } else if (!(outcome === 'network' && w.jobId)) {
       const fails = (row?.write_fails ?? 0) + 1;
-      // An item gone from Steam is re-checked through its details; anything else backs off up to a day.
-      const backoff = outcome === 'not_found' ? DAY : Math.min(DAY, HOUR * 2 ** Math.min(fails - 1, 5));
+      // An item gone from Steam is re-checked through its details, a network problem soon passes, and anything
+      // else backs off up to a day.
+      const backoff = outcome === 'not_found' ? DAY
+        : outcome === 'network' ? Math.min(HOUR, 5 * MIN * 2 ** Math.min(fails - 1, 4))
+        : Math.min(DAY, HOUR * 2 ** Math.min(fails - 1, 5));
       if (outcome === 'not_found') q("UPDATE items SET status = 'unavailable', details_at = 0 WHERE id = ?").run(w.id);
       q(`INSERT INTO account_items (account_id, item_id, write_error, write_fails, write_next_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(account_id, item_id) DO UPDATE SET write_error = excluded.write_error, write_fails = excluded.write_fails,
            write_next_at = excluded.write_next_at, updated_at = excluded.updated_at`)
         .run(acc.id, w.id, message, fails, now + backoff, now);
+      if (acc.is_main && !w.jobId && w.action === 'subscribe' && (outcome === 'denied' || outcome === 'not_found')) holdRefused(acc, w.id, message, now);
     }
-    if (w.jobId) {
-      q('UPDATE job_items SET state = ?, error = ?, done_at = ? WHERE job_id = ? AND account_id = ? AND item_id = ?')
-        .run(outcome === 'ok' ? 'done' : 'failed', message, now, w.jobId, acc.id, w.id);
-    }
+    if (w.jobId) recordJobWrite(acc.id, w.jobId, w.id, outcome, message, now);
     return reapplied;
   });
+}
+
+function recordJobWrite(accountId: number, jobId: number, itemId: string, outcome: string, message: string, now: number): void {
+  const keys = [jobId, accountId, itemId] as const;
+  if (outcome === 'network') {
+    // A network problem says nothing about the item: it goes round again, a little later each time.
+    const { attempts } = (q('SELECT attempts FROM job_items WHERE job_id = ? AND account_id = ? AND item_id = ?').get(...keys) ?? { attempts: 0 }) as { attempts: number };
+    if (attempts + 1 < JOB_ATTEMPTS) {
+      q("UPDATE job_items SET attempts = ?, next_at = ?, error = ? WHERE job_id = ? AND account_id = ? AND item_id = ? AND state = 'pending'")
+        .run(attempts + 1, now + Math.min(30 * MIN, MIN * 2 ** attempts), message, ...keys);
+      return;
+    }
+  }
+  // Only a pending row: a job cancelled while this write was on its way stays cancelled.
+  q("UPDATE job_items SET state = ?, error = ?, done_at = ? WHERE job_id = ? AND account_id = ? AND item_id = ? AND state = 'pending'")
+    .run(outcome === 'ok' ? 'done' : 'failed', message, now, ...keys);
+}
+
+/** Job subscribes that verification did not find on the list. */
+export function failJobWrites(accountId: number, writes: PendingWrite[], message: string): void {
+  for (const w of writes) {
+    if (w.jobId) q('UPDATE job_items SET state = ?, error = ? WHERE job_id = ? AND account_id = ? AND item_id = ?').run('failed', message, w.jobId, accountId, w.id);
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Housekeeping (run every scheduler cycle)
 // ---------------------------------------------------------------------------
 /**
- * "Removing" becomes "removed" once no member still has the item, except members that cannot be signed in
- * and members that another active group still syncs it to (those keep it, and must not hold the removal up).
+ * "Removing" becomes "removed" once no member still has the item, except members that another active group
+ * still syncs it to (those keep it, and must not hold the removal up). A member that is disabled or waiting
+ * for a sign-in holds it up too, so it loses the item when it comes back. Its list only counts if it is known
+ * to have the item: one that was never read may wait for a long time.
  */
 export function completeRemovals(): void {
   const done = q(`SELECT gi.group_id, gi.item_id FROM group_items gi
                   JOIN groups g ON g.id = gi.group_id AND g.state = 'active'
                   JOIN items i ON i.id = gi.item_id
+                  LEFT JOIN group_apps ga ON ga.group_id = gi.group_id AND ga.appid = i.appid
                   WHERE gi.state = 'removing' AND NOT EXISTS (
                     SELECT 1 FROM group_members gm
-                    JOIN accounts a ON a.id = gm.account_id AND a.enabled = 1 AND a.status NOT IN ('bad_credentials', 'needs_signin')
+                    JOIN accounts a ON a.id = gm.account_id
                     LEFT JOIN account_apps aa ON aa.account_id = gm.account_id AND aa.appid = i.appid
                     LEFT JOIN account_items ai ON ai.account_id = gm.account_id AND ai.item_id = gi.item_id
                     WHERE gm.group_id = gi.group_id
-                      AND (COALESCE(aa.initialized, 0) = 0 OR COALESCE(ai.present, 0) = 1)
+                      AND (COALESCE(ai.present, 0) = 1 OR (COALESCE(aa.initialized, 0) = 0 AND ga.appid IS NOT NULL
+                           AND a.enabled = 1 AND a.status NOT IN ('bad_credentials', 'needs_signin')))
                       AND NOT EXISTS (
                         SELECT 1 FROM group_items gi2
                         JOIN groups g2 ON g2.id = gi2.group_id AND g2.state = 'active'
@@ -548,6 +680,8 @@ export interface StartPlan {
   approvals: { item: string; groups: number[] }[];
   perAccount: { id: number; username: string; is_main: boolean; has: number; missing: number; missingBytes: number; unreadable: boolean }[];
   writes: number;
+  /** Items blocked or being removed in the group that members hold now. */
+  unsubscribes: number;
   /** Total size of the shared items, and how many of them Steam has not given a size for (yet). */
   bytes: number;
   unsized: number;
@@ -555,9 +689,10 @@ export interface StartPlan {
 }
 
 /**
- * What starting a group would do: every member's items for the group's games are shared with all members.
- * The main account's items join unless they already belong to another group, or another group plays the
- * same game (then the admin picks the group, as for any new item on the main account).
+ * What starting a group would do: every member's items for the group's games are shared with all members,
+ * along with anything the admin already added to the group. The main account's items join unless they already
+ * belong to another group, or another group plays the same game (then the admin picks the group, as for any
+ * new item on the main account).
  */
 export function computeStart(g: Group): StartPlan {
   const apps = new Set(groupApps(g.id));
@@ -571,13 +706,16 @@ export function computeStart(g: Group): StartPlan {
   // Items the admin blocked here before the start stay blocked.
   const blocked = (id: string) => groupItemState(g.id, id) === 'blocked';
   for (const m of members.filter((x) => !x.is_main)) for (const r of presentOf(m.id)) if (!blocked(r.item_id)) union.add(r.item_id);
+  const groupRows = q(`SELECT gi.item_id, gi.state FROM group_items gi JOIN items i ON i.id = gi.item_id
+                       JOIN group_apps ga ON ga.group_id = gi.group_id AND ga.appid = i.appid WHERE gi.group_id = ?`).all(g.id) as { item_id: string; state: ItemState }[];
+  for (const r of groupRows) if (r.state === 'active') union.add(r.item_id);
   const main = members.find((x) => x.is_main);
   if (main) {
     for (const r of presentOf(main.id)) {
       if (union.has(r.item_id) || blocked(r.item_id)) continue;
       if (q("SELECT 1 FROM group_items WHERE item_id = ? AND group_id != ? AND state != 'removed' LIMIT 1").get(r.item_id, g.id)) continue;
       if (q("SELECT 1 FROM approvals WHERE item_id = ? AND status = 'ignored'").get(r.item_id)) continue;
-      const others = activeGroupsFor(main.id, r.appid).filter((x) => x.id !== g.id);
+      const others = syncingGroupsFor(main.id, r.appid).filter((x) => x.id !== g.id);
       if (others.length) approvals.push({ item: r.item_id, groups: [g.id, ...others.map((x) => x.id)] });
       else union.add(r.item_id);
     }
@@ -585,17 +723,25 @@ export function computeStart(g: Group): StartPlan {
   const sizeOf = (id: string) => (q('SELECT file_size FROM items WHERE id = ?').get(id) as { file_size: number | null } | undefined)?.file_size ?? 0;
   const sizes = new Map([...union].map((id) => [id, sizeOf(id)]));
   const total = [...sizes.values()].reduce((n, b) => n + b, 0);
+  // An item gone from Steam cannot be subscribed, so it is no write and no download.
+  const available = (id: string) => (q('SELECT status FROM items WHERE id = ?').get(id) as { status: string } | undefined)?.status === 'ok';
+  const unwanted = new Set(groupRows.filter((r) => r.state === 'blocked' || r.state === 'removing').map((r) => r.item_id));
+  let unsubscribes = 0;
   const perAccount = members.map((m) => {
-    const mine = presentOf(m.id).filter((r) => union.has(r.item_id));
-    const hasBytes = mine.reduce((n, r) => n + (sizes.get(r.item_id) ?? 0), 0);
+    const present = presentOf(m.id);
+    const mine = new Set(present.filter((r) => union.has(r.item_id)).map((r) => r.item_id));
+    const toGet = [...union].filter((id) => !mine.has(id) && available(id));
+    if (m.enabled) unsubscribes += present.filter((r) => unwanted.has(r.item_id)).length;
     return {
-      id: m.id, username: m.username, is_main: !!m.is_main, has: mine.length, missing: union.size - mine.length,
-      missingBytes: total - hasBytes, unreadable: unreadable(m),
+      id: m.id, username: m.username, is_main: !!m.is_main, has: mine.size, missing: toGet.length,
+      missingBytes: toGet.reduce((n, id) => n + (sizes.get(id) ?? 0), 0), unreadable: unreadable(m),
     };
   });
+  const enabled = new Set(members.filter((m) => m.enabled).map((m) => m.id));
   return {
     items: [...union], approvals, perAccount,
-    writes: perAccount.reduce((n, a) => n + a.missing, 0),
+    writes: perAccount.filter((a) => enabled.has(a.id)).reduce((n, a) => n + a.missing, 0),
+    unsubscribes,
     bytes: total, unsized: [...sizes.values()].filter((b) => !b).length, computed_at: Date.now(),
   };
 }
@@ -635,9 +781,8 @@ export async function refreshDetails(timeoutMs: number): Promise<void> {
   }
 }
 
-/** Adds a collection's items (and those of collections inside it) that the group does not have yet. */
-async function expandCollection(groupId: number, collectionId: string, timeoutMs: number): Promise<number> {
-  const apps = new Set(groupApps(groupId));
+/** The items of a collection and of the collections inside it, three levels down. */
+export async function collectionItems(collectionId: string, timeoutMs: number): Promise<Set<string>> {
   const itemIds = new Set<string>();
   let level = [collectionId];
   const visited = new Set<string>();
@@ -654,6 +799,13 @@ async function expandCollection(groupId: number, collectionId: string, timeoutMs
     }
     level = next;
   }
+  return itemIds;
+}
+
+/** Adds a collection's items (and those of collections inside it) that the group does not have yet. */
+async function expandCollection(groupId: number, collectionId: string, timeoutMs: number): Promise<number> {
+  const apps = new Set(groupApps(groupId));
+  const itemIds = await collectionItems(collectionId, timeoutMs);
   const details = await fetchItemDetails([...itemIds], timeoutMs);
   let added = 0;
   tx(() => {
@@ -740,6 +892,7 @@ export function updateGroup(id: number, fields: { name?: string; appids?: number
     const newApps = apps.filter((a) => !oldApps.includes(a));
     const newMembers = members.filter((m) => !oldMembers.includes(m));
     const stayed = members.filter((m) => !newMembers.includes(m));
+    if (fields.appids) pruneApprovals();
     if (g.state !== 'setup') {
       ensureReads(newMembers, apps);
       ensureReads(stayed, newApps);
@@ -759,14 +912,23 @@ export function deleteGroup(id: number): void {
   if (!g) return;
   tx(() => {
     q('DELETE FROM groups WHERE id = ?').run(id);
-    // Approvals that only offered this group have nowhere to go now.
-    for (const a of q("SELECT item_id, group_ids FROM approvals WHERE status = 'pending'").all() as { item_id: string; group_ids: string }[]) {
-      const left = a.group_ids.split(',').filter((x) => Number(x) !== id);
-      if (!left.length) q('DELETE FROM approvals WHERE item_id = ?').run(a.item_id);
-      else q('UPDATE approvals SET group_ids = ? WHERE item_id = ?').run(left.join(','), a.item_id);
-    }
+    pruneApprovals();
   });
   addEvent(null, 'admin', `Group ${g.name} deleted (nothing was unsubscribed)`);
+}
+
+/** A pick only offers groups that sync the item's game. With one group left the game decides, as for any new item. */
+function pruneApprovals(): void {
+  const rows = q(`SELECT a.item_id, a.group_ids, i.appid FROM approvals a JOIN items i ON i.id = a.item_id
+                  WHERE a.status = 'pending'`).all() as { item_id: string; group_ids: string; appid: number }[];
+  for (const a of rows) {
+    const offered = a.group_ids.split(',').map(Number);
+    const left = offered.filter((id) => q('SELECT 1 FROM group_apps WHERE group_id = ? AND appid = ?').get(id, a.appid));
+    if (left.length === offered.length) continue;
+    if (!left.length) q('DELETE FROM approvals WHERE item_id = ?').run(a.item_id);
+    else if (left.length === 1) setGroupItem(left[0], a.item_id, 'active', 'found on the main account');
+    else q('UPDATE approvals SET group_ids = ? WHERE item_id = ?').run(left.join(','), a.item_id);
+  }
 }
 
 /** start / confirm / pause / resume. Returns the accounts that need a read now. */
@@ -821,8 +983,22 @@ export function groupAction(id: number, action: 'start' | 'confirm' | 'pause' | 
 /** Makes this account the main account (or none) and adds it to every group. */
 export function setMain(accountId: number | null): void {
   tx(() => {
+    const before = getMainAccount();
     q('UPDATE accounts SET is_main = CASE WHEN id = ? THEN 1 ELSE 0 END').run(accountId ?? -1);
-    if (accountId === null) return;
+    // Held removals are about one main account, and a new one starts without them.
+    q("UPDATE account_items SET removal_held = 0, held_reason = '' WHERE account_id != ?").run(accountId ?? -1);
+    if (accountId === null) {
+      addEvent(null, 'admin', `${before?.username ?? 'The account'} is no longer the main account`);
+      return;
+    }
+    const acc = getAccount(accountId)!;
+    if (acc.password_enc) {
+      // The main account's password is never stored. Without a sign-in it has to get one from the web UI.
+      const parked = !acc.refresh_token_enc;
+      q('UPDATE accounts SET password_enc = NULL, interactive = 1, status = ?, status_msg = ? WHERE id = ?')
+        .run(parked ? 'needs_signin' : acc.status, parked ? 'Sign in from the web UI' : acc.status_msg, accountId);
+    }
+    addEvent(null, 'admin', `${acc.username} is now the main account${before ? `, replacing ${before.username}` : ''}${acc.password_enc ? '; its stored password was removed' : ''}`);
     const now = Date.now();
     for (const g of q('SELECT * FROM groups').all() as unknown as Group[]) {
       const added = Number(q('INSERT OR IGNORE INTO group_members (group_id, account_id, added_at) VALUES (?, ?, ?)').run(g.id, accountId, now).changes);
@@ -842,7 +1018,7 @@ export function itemAction(groupId: number, itemId: string, action: ItemAction):
   tx(() => {
     setGroupItem(groupId, itemId, next[action], 'admin');
     // A fresh decision deserves a fresh try on every member, not the back-off of earlier failures.
-    q(`UPDATE account_items SET write_next_at = 0, write_fails = 0, write_error = ''
+    q(`UPDATE account_items SET write_next_at = 0, write_fails = 0, write_error = '', removal_held = 0, held_reason = ''
        WHERE item_id = ? AND account_id IN (SELECT account_id FROM group_members WHERE group_id = ?)`).run(itemId, groupId);
   });
   addEvent(null, 'admin', `${g.name}: ${itemLabel(itemId)} ${{ block: 'blocked', unblock: 'unblocked', remove: 'removed from every member', restore: 'added back' }[action]}`);
@@ -882,9 +1058,12 @@ export async function addToGroup(groupId: number, ids: string[], timeoutMs: numb
     tx(() => {
       upsertItemDetails(d);
       const state = groupItemState(groupId, id);
-      if (state !== 'active') setGroupItem(groupId, id, 'active', 'added by the admin');
+      if (state === 'blocked') out.skipped.push({ id, reason: 'blocked in this group: unblock it first' });
+      else if (state !== 'active') {
+        setGroupItem(groupId, id, 'active', 'added by the admin');
+        out.added++;
+      }
     });
-    out.added++;
   }
   addEvent(null, 'admin', `${g.name}: added ${out.added} item(s)${out.collections ? ` from ${out.collections} collection(s) and items` : ''}` +
     `${out.skipped.length ? `, skipped ${out.skipped.length}` : ''}`);
@@ -926,10 +1105,10 @@ export function resolveApproval(itemId: string, groupId: number | null): void {
 }
 
 export function listHeld() {
-  return q(`SELECT ai.account_id, a.username, ai.item_id, ai.lost_at, i.title, i.appid FROM account_items ai
+  return q(`SELECT ai.account_id, a.username, ai.item_id, ai.lost_at, ai.held_reason, i.title, i.appid FROM account_items ai
             JOIN accounts a ON a.id = ai.account_id JOIN items i ON i.id = ai.item_id
-            WHERE ai.removal_held = 1 ORDER BY ai.lost_at, i.title`).all() as
-    { account_id: number; username: string; item_id: string; lost_at: number; title: string; appid: number }[];
+            WHERE ai.removal_held != 0 ORDER BY ai.lost_at, i.title`).all() as
+    { account_id: number; username: string; item_id: string; lost_at: number; held_reason: string; title: string; appid: number }[];
 }
 
 /** approve: remove the items from every member. restore: subscribe the main account to them again. */
@@ -937,8 +1116,14 @@ export function resolveHeld(itemIds: string[] | 'all', action: 'approve' | 'rest
   const held = listHeld().filter((h) => itemIds === 'all' || itemIds.includes(h.item_id));
   if (!held.length) return 0;
   tx(() => {
-    for (const h of held) q('UPDATE account_items SET removal_held = 0 WHERE account_id = ? AND item_id = ?').run(h.account_id, h.item_id);
+    // Restoring is a fresh decision, so a subscribe Steam refused earlier gets tried again at once.
+    for (const h of held) {
+      q(`UPDATE account_items SET removal_held = 0, held_reason = '', write_next_at = 0, write_fails = 0, write_error = ''
+         WHERE account_id = ? AND item_id = ?`).run(h.account_id, h.item_id);
+    }
     if (action === 'approve') {
+      // Decided: they no longer count towards the next hold.
+      for (const h of held) q('UPDATE account_items SET lost_at = NULL WHERE account_id = ? AND item_id = ?').run(h.account_id, h.item_id);
       const byAccount = new Map<number, string[]>();
       for (const h of held) byAccount.set(h.account_id, [...(byAccount.get(h.account_id) ?? []), h.item_id]);
       for (const [accountId, ids] of byAccount) removeFromGroups(getAccount(accountId)!, ids);

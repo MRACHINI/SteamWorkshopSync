@@ -8,7 +8,9 @@ import path from 'node:path';
 
 const realConnect = net.Socket.prototype.connect;
 net.Socket.prototype.connect = function (...args) {
-  const opts = typeof args[0] === 'object' ? args[0] : { port: args[0], host: args[1] };
+  // net.connect() passes its arguments on as one array.
+  const first = Array.isArray(args[0]) ? args[0][0] : args[0];
+  const opts = typeof first === 'object' ? first : { port: first, host: args[1] };
   const host = opts.host ?? 'localhost';
   if (!['localhost', '127.0.0.1', '::1'].includes(host) && !opts.path) throw new Error(`test blocked an outbound connection to ${host}`);
   return realConnect.apply(this, args);
@@ -84,7 +86,9 @@ export function installFakeSteam() {
     const appid = Number(url.searchParams.get('appid'));
     const page = Number(url.searchParams.get('p') || 1);
     const per = [10, 20, 30].includes(Number(url.searchParams.get('numperpage'))) ? Number(url.searchParams.get('numperpage')) : 10;
-    const ids = steam.hidden.has(steamid) ? [] : steam.subs(steamid, appid);
+    // Sorted as asked: anything but the subscription date would break the "newest first" quick read.
+    const listed = steam.hidden.has(steamid) || url.searchParams.get('browsefilter') !== 'mysubscriptions' ? [] : steam.subs(steamid, appid);
+    const ids = url.searchParams.get('sortmethod') === 'subscriptiondate' ? listed : [...listed].reverse();
     const slice = ids.slice((page - 1) * per, page * per);
     const head = `<html><head><title>Steam Community :: Someone :: Subscribed Items</title></head><body>
       <script>g_steamID = ${viewer ? `"${viewer}"` : 'false'};</script>`;

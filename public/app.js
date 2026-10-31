@@ -116,10 +116,15 @@ function openDialog(html, onSubmit, onClose) {
   const form = $('#dialogForm');
   form.innerHTML = html;
   form.onclick = null;
+  // Not submit buttons: Enter belongs to the form's main button, and Cancel has to work on an unfinished form.
+  $$('button[value=cancel]', form).forEach((b) => {
+    b.type = 'button';
+    b.onclick = () => dlg.close();
+  });
   form.onsubmit = async (e) => {
     e.preventDefault();
     const btn = e.submitter;
-    if (!btn || btn.value === 'cancel') return dlg.close();
+    if (!btn) return dlg.close();
     const err = $('[data-error]', form);
     if (err) err.textContent = '';
     btn.disabled = true;
@@ -158,6 +163,7 @@ function showLogin() {
   view.innerHTML = '';
   $('#app').hidden = true;
   $('#login').hidden = false;
+  $('#loginPlain').hidden = location.protocol === 'https:' || /^(localhost|127\.|\[::1\])/.test(location.hostname);
   $('#loginPassword').value = '';
   $('#loginPassword').focus();
 }
@@ -199,9 +205,13 @@ $('#tabs').addEventListener('click', (e) => {
 });
 window.addEventListener('hashchange', onRoute);
 
-function onRoute() {
+async function onRoute() {
   if (!role) return;
   route = parseRoute();
+  if (!isAdmin() && (route.tab === 'settings' || route.tab === 'logs')) {
+    location.hash = 'accounts';
+    return;
+  }
   $$('#tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === route.tab));
   const render = {
     accounts: renderAccounts, groups: route.id ? renderGroupDetail : renderGroups, main: renderMain, jobs: renderJobs,
@@ -210,13 +220,31 @@ function onRoute() {
   view.onclick = null;
   view.oninput = null;
   view.onchange = null;
-  render();
+  try {
+    await render();
+  } catch (ex) {
+    showLoadError(ex);
+  }
 }
+
+function showLoadError(ex) {
+  if (ex.message === 'Signed out') return;
+  view.onclick = (e) => e.target.closest('[data-act=retry]') && onRoute();
+  view.innerHTML = `<div class="card"><p class="error">This page could not be loaded: ${esc(ex.message)}</p><button data-act="retry">Try again</button></div>`;
+}
+
+let offlineSince = null;
 
 async function refreshState() {
   try {
     state = await api('GET', '/api/state');
-  } catch {
+    offlineSince = null;
+  } catch (ex) {
+    if (ex.message !== 'Signed out') {
+      offlineSince ??= Date.now();
+      $('#banner').textContent = `Cannot reach the server since ${fmtTime(offlineSince)}. What you see here may be out of date.`;
+      $('#banner').hidden = false;
+    }
     return;
   }
   renderBanner();
@@ -233,7 +261,8 @@ async function refreshState() {
 
 const pollHooks = {
   accounts: () => drawAccounts(),
-  groups: () => (route.id ? gDetail && tick % 2 === 0 && loadGroupDetail(false) : drawGroups()),
+  groups: () => (route.id ? tick % 2 === 0 && loadGroupDetail(false) : drawGroups()),
+  main: () => loadMain(),
   jobs: () => loadJobs(),
   logs: () => loadLogs(),
 };
@@ -300,7 +329,7 @@ function drawAccounts() {
   const signin = (a) => {
     if (!a.signed_in) return '<span class="muted">—</span>';
     if (a.has_password && !a.interactive) return '<span class="muted">renews itself</span>';
-    const soon = a.token_expires_at && a.token_expires_at - Date.now() < 14 * 86400_000;
+    const soon = a.token_expires_at && a.token_expires_at - Date.now() < state.tokenWarnDays * 86400_000;
     return `<span class="${soon ? 'error' : ''}">until ${esc(fmtDate(a.token_expires_at))}</span>`;
   };
   $('#accTable').innerHTML = `<table>
@@ -318,7 +347,7 @@ function drawAccounts() {
       <td class="hide-sm small">${signin(a)}</td>
       <td class="actions">${isAdmin() ? `
         ${a.status === 'needs_signin' || !a.has_password ? `<button class="small ${a.status === 'needs_signin' ? 'primary' : ''}" data-act="signin" data-id="${a.id}">Sign in</button>` : ''}
-        <button class="small" data-act="check" data-id="${a.id}">Check</button>
+        ${a.enabled ? `<button class="small" data-act="check" data-id="${a.id}">Check</button>` : ''}
         <button class="small" data-act="edit" data-id="${a.id}">Edit</button>
         <button class="small danger" data-act="delete" data-id="${a.id}">Delete</button>` : ''}</td>
     </tr>`).join('')}</tbody></table>`;
@@ -355,7 +384,8 @@ async function onAccountsClick(e) {
 
 function accountDialog(acc) {
   const isNew = !acc;
-  openDialog(`<h2>${isNew ? 'Add account' : `Edit ${esc(acc.username)}`}</h2>
+  const currentMain = state?.accounts.find((a) => a.is_main);
+  const form = openDialog(`<h2>${isNew ? 'Add account' : `Edit ${esc(acc.username)}`}</h2>
     ${isNew ? '<label>Steam account name (the login name, not the profile name) <input name="username" required autocomplete="off"></label>' : ''}
     <label>Password ${isNew ? '' : '(blank = keep)'}
       <input type="password" name="password" autocomplete="new-password"></label>
@@ -363,6 +393,7 @@ function accountDialog(acc) {
     ${!isNew && acc.has_password ? '<label class="check"><input type="checkbox" name="forget_password"> Forget the stored password</label>' : ''}
     <label>Note <input name="note" value="${esc(acc?.note ?? '')}"></label>
     <label class="check"><input type="checkbox" name="is_main" ${acc?.is_main ? 'checked' : ''}> Main account (plays every game, is in every group and decides removals)</label>
+    <p class="small error" data-mainnote hidden></p>
     ${!isNew ? `<label class="check"><input type="checkbox" name="enabled" ${acc.enabled ? 'checked' : ''}> Enabled</label>` : ''}
     <p class="error" data-error></p>
     <div class="buttons"><button value="cancel">Cancel</button><button value="save" class="primary">Save</button></div>`,
@@ -384,6 +415,21 @@ function accountDialog(acc) {
       refreshState();
     }
   });
+  const main = $('[name=is_main]', form);
+  const syncMain = () => {
+    const pw = $('[name=password]', form);
+    pw.disabled = main.checked;
+    pw.placeholder = main.checked ? "The main account's password is never stored" : '';
+    if (main.checked) pw.value = '';
+    const note = $('[data-mainnote]', form);
+    note.textContent = main.checked ? [
+      currentMain && currentMain.id !== acc?.id ? `This replaces ${currentMain.username} as the main account: from then on this account decides removals.` : '',
+      acc?.has_password ? 'Its stored password will be removed.' : '',
+    ].filter(Boolean).join(' ') : '';
+    note.hidden = !note.textContent;
+  };
+  main.onchange = syncMain;
+  syncMain();
 }
 
 function importDialog() {
@@ -395,7 +441,7 @@ function importDialog() {
     <div class="buttons"><button value="cancel">Cancel</button><button value="go" class="primary">Import</button></div>`,
   async (fd) => {
     const r = await api('POST', '/api/accounts/import', { text: fd.get('text') });
-    toast(`${plural(r.count, 'account')} imported`);
+    toast(`${plural(r.count, 'account')} imported${r.skipped?.length ? `. Skipped the main account, whose password is never stored: ${r.skipped.join(', ')}` : ''}`);
     refreshState();
   });
 }
@@ -405,14 +451,15 @@ function signinDialog(acc) {
   let sid = null;
   let timer = null;
   let finished = false;
+  let shownQr = '';
   const form = openDialog(`<h2>Sign in ${esc(acc.username)}</h2>
     <p class="small muted">For accounts with Steam Guard. The app keeps the sign-in Steam hands out (valid for about 7 months) and warns
-      before it runs out. The password is only stored if you tick "remember".</p>
+      before it runs out. ${acc.is_main ? "The main account's password is never stored." : 'The password is only stored if you tick "remember".'}</p>
     <div class="toolbar"><button type="button" data-mode="qr">QR code (Steam mobile app)</button><button type="button" data-mode="pw">Password and code</button></div>
     <div data-pane="qr" hidden><div class="qr" data-qr><p class="muted">Getting a code from Steam…</p></div></div>
     <div data-pane="pw" hidden>
       <label>Password <input type="password" name="password" autocomplete="off"></label>
-      <label class="check"><input type="checkbox" name="remember"> Remember the password</label>
+      ${acc.is_main ? '' : '<label class="check"><input type="checkbox" name="remember"> Remember the password</label>'}
       <label data-codebox hidden>Steam Guard code <input name="code" autocomplete="one-time-code" inputmode="text"></label>
     </div>
     <p data-msg class="wrap"></p>
@@ -438,7 +485,10 @@ function signinDialog(acc) {
     sid = s.id;
     $('[data-msg]', form).textContent = s.message || '';
     $('[data-msg]', form).className = `wrap ${s.state === 'failed' ? 'error' : ''}`;
-    if (s.qrSvg) $('[data-qr]', form).innerHTML = s.qrSvg;
+    if (s.qrSvg && s.qrSvg !== shownQr) {
+      shownQr = s.qrSvg;
+      $('[data-qr]', form).innerHTML = s.qrSvg;
+    }
     const needCode = s.state === 'need_code';
     $('[data-codebox]', form).hidden = !needCode;
     $('[data-go]', form).textContent = needCode ? 'Submit code' : 'Sign in';
@@ -450,12 +500,14 @@ function signinDialog(acc) {
       setTimeout(() => $('#dialog').close(), 900);
     } else if (s.state === 'failed') {
       clearInterval(timer);
+      timer = null;
     } else if (!timer) {
       timer = setInterval(async () => {
         try {
           show(await api('GET', `/api/signin/${sid}`));
         } catch (ex) {
           clearInterval(timer);
+          timer = null;
           $('[data-error]', form).textContent = ex.message;
         }
       }, 2000);
@@ -477,6 +529,7 @@ function signinDialog(acc) {
     $('[data-go]', form).hidden = m.dataset.mode !== 'pw';
     $('[data-codebox]', form).hidden = true;
     if (m.dataset.mode === 'qr') {
+      shownQr = '';
       $('[data-qr]', form).innerHTML = '<p class="muted">Getting a code from Steam…</p>';
       try {
         show(await api('POST', `/api/accounts/${acc.id}/signin/qr`));
@@ -561,11 +614,14 @@ let gDetail = null;
 let gItems = [];
 let gFilter = { state: 'active', search: '', page: 0 };
 const PAGE = 100;
+/** Items whose per-account row is open, so it stays open when the list is redrawn. */
+const openCells = new Set();
 
 function renderGroupDetail() {
   gDetail = null;
   gItems = [];
   gFilter = { state: 'active', search: '', page: 0 };
+  openCells.clear();
   view.innerHTML = `
     <div class="toolbar"><a href="#groups">← Groups</a><span class="spacer"></span><span id="gButtons"></span></div>
     <div id="gHead" class="card"><p class="muted">Loading…</p></div>
@@ -618,6 +674,8 @@ async function loadGroupDetail(withItems) {
     if (ex.status === 404) {
       toast('Group not found', true);
       location.hash = 'groups';
+    } else if (!gDetail && $('#gHead')) {
+      $('#gHead').innerHTML = `<p class="error">This group could not be loaded: ${esc(ex.message)}. Trying again…</p>`;
     }
   }
 }
@@ -656,6 +714,7 @@ function drawGroupDetail(redrawItems = true) {
   $('#gPreview').innerHTML = g.state === 'preview' && p ? `<div class="card">
       <h2>Preview of the first sync</h2>
       <p>${plural(p.items.length, 'item')} (${sizeTotal(p.bytes, p.unsized)}) will be shared with every member: ${plural(p.writes, 'subscription')} to make.
+        ${p.unsubscribes ? `${plural(p.unsubscribes, 'subscription')} of blocked or removed items will be unsubscribed.` : ''}
         ${p.approvals.length ? `${plural(p.approvals.length, 'item')} on the main account also match another group and will wait for you to pick one.` : ''}</p>
       <table><thead><tr><th>Account</th><th class="num">Already has</th><th class="num">Will get</th><th class="num">To download</th><th></th></tr></thead>
       <tbody>${p.perAccount.map((a) => `<tr><td>${esc(a.username)} ${a.is_main ? '<span class="badge">main</span>' : ''}</td>
@@ -670,8 +729,8 @@ function drawGroupDetail(redrawItems = true) {
     <tbody>${gDetail.members.map((m) => `<tr>
       <td>${esc(m.username)} ${m.is_main ? '<span class="badge">main</span>' : ''}</td>
       <td>${badge(ACCOUNT_STATUS, m.status)} ${m.read ? '' : '<span class="badge dim">not read yet</span>'}</td>
-      <td class="num">${m.has} / ${gDetail.items.active}</td>
-      <td class="num">${m.has < gDetail.items.active ? fmtSize(m.missing_bytes) : ''}</td>
+      <td class="num">${m.has} / ${gDetail.available}</td>
+      <td class="num">${m.has < gDetail.available ? fmtSize(m.missing_bytes) : ''}</td>
       <td class="num">${m.failing ? `<span class="error">${m.failing}</span>` : ''}</td></tr>`).join('')}</tbody></table>`;
 
   $('#gColls').innerHTML = gDetail.collections.length ? `<table><tbody>${gDetail.collections.map((c) => `<tr>
@@ -714,12 +773,25 @@ function drawItems() {
       <span class="small">Page ${gFilter.page + 1} of ${pages} · ${list.length} items</span>
       <button class="small" data-act="page" data-id="1" ${gFilter.page < pages - 1 ? '' : 'disabled'}>›</button></div>` : ''}`
     : '<p class="muted">No items here.</p>';
+  for (const id of openCells) {
+    const row = $(`tr[data-row="${CSS.escape(id)}"]`);
+    if (row) showCells(id, row).catch(() => {});
+  }
+}
+
+async function toggleCells(itemId, rowEl) {
+  const next = rowEl.nextElementSibling;
+  if (next?.dataset.cells) {
+    openCells.delete(itemId);
+    return next.remove();
+  }
+  openCells.add(itemId);
+  await showCells(itemId, rowEl);
 }
 
 async function showCells(itemId, rowEl) {
-  const next = rowEl.nextElementSibling;
-  if (next?.dataset.cells) return next.remove();
   const { cells } = await api('GET', `/api/groups/${route.id}/items/${itemId}`);
+  if (rowEl.nextElementSibling?.dataset.cells) rowEl.nextElementSibling.remove();
   const tr = document.createElement('tr');
   tr.dataset.cells = '1';
   tr.innerHTML = `<td colspan="6"><div class="cells">${cells.map((c) => {
@@ -745,7 +817,7 @@ async function onGroupClick(e) {
       case 'page':
         gFilter.page += Number(b.dataset.id);
         return drawItems();
-      case 'cells': return showCells(b.dataset.id, b.closest('tr'));
+      case 'cells': return await toggleCells(b.dataset.id, b.closest('tr'));
       case 'deleteGroup':
         if (!(await confirmDialog('Delete group', `Delete ${g.name}? Nothing is unsubscribed: every account keeps what it has.`, 'Delete', true))) return;
         await api('DELETE', `/api/groups/${id}`);
@@ -755,7 +827,7 @@ async function onGroupClick(e) {
       case 'confirm':
       case 'pause':
       case 'resume':
-        if (b.dataset.act === 'confirm' && !(await confirmDialog('Start syncing', `Share ${plural(g.preview?.items.length ?? 0, 'item')} with every member of ${g.name} (${plural(g.preview?.writes ?? 0, 'subscription')})?`, 'Start syncing'))) return;
+        if (b.dataset.act === 'confirm' && !(await confirmDialog('Start syncing', `Share ${plural(g.preview?.items.length ?? 0, 'item')} with every member of ${g.name} (${plural(g.preview?.writes ?? 0, 'subscription')}${g.preview?.unsubscribes ? `, and ${g.preview.unsubscribes} to remove` : ''})?`, 'Start syncing'))) return;
         await api('POST', `/api/groups/${id}/${b.dataset.act}`);
         toast({ start: 'Reading the members\' lists', confirm: 'Syncing started', pause: 'Paused', resume: 'Resumed' }[b.dataset.act]);
         await loadGroupDetail(true);
@@ -813,17 +885,26 @@ async function renderMain() {
     <div class="card" id="heldBox"><p class="muted">Loading…</p></div>
     <div class="card" id="apprBox"></div>`;
   view.onclick = onMainClick;
+  mainShown = '';
   await loadMain();
 }
 
+let mainShown = '';
+
 async function loadMain() {
-  const { approvals, held } = await api('GET', '/api/approvals');
+  if (route.tab !== 'main') return;
+  const data = await api('GET', '/api/approvals');
+  const shown = JSON.stringify(data);
+  if (!$('#heldBox') || shown === mainShown) return;
+  mainShown = shown;
+  const { approvals, held } = data;
+  const ticked = new Set($$('[data-held]:checked').map((c) => c.value));
   $('#heldBox').innerHTML = `<h2>Held removals</h2>
-    <p class="small muted">More items disappeared from the main account at once than the hold threshold in Settings. Nothing was removed from the members yet.</p>
-    ${held.length ? `<table><thead><tr><th>${isAdmin() ? '<input type="checkbox" data-all>' : ''}</th><th>Item</th><th>Account</th><th>Disappeared</th></tr></thead>
+    <p class="small muted">More items left the main account at once than the hold threshold in Settings, or Steam refused the main account an item. Nothing was removed from the members yet.</p>
+    ${held.length ? `<table><thead><tr><th>${isAdmin() ? '<input type="checkbox" data-all>' : ''}</th><th>Item</th><th>Account</th><th>When</th><th>Why</th></tr></thead>
       <tbody>${held.map((h) => `<tr><td>${isAdmin() ? `<input type="checkbox" data-held value="${esc(h.item_id)}">` : ''}</td>
         <td><a href="${workshopUrl(h.item_id)}" target="_blank" rel="noopener">${esc(h.title || h.item_id)}</a> <span class="muted small">app ${h.appid}</span></td>
-        <td>${esc(h.username)}</td><td>${esc(fmtTime(h.lost_at))}</td></tr>`).join('')}</tbody></table>
+        <td>${esc(h.username)}</td><td>${esc(fmtTime(h.lost_at))}</td><td class="small wrap">${esc(h.held_reason || 'Disappeared from the list')}</td></tr>`).join('')}</tbody></table>
       ${isAdmin() ? `<div class="toolbar" style="margin-top:10px">
         <button data-act="held" data-mode="approve" class="danger">Remove selected from the members</button>
         <button data-act="held" data-mode="restore" class="primary">Subscribe the main account to them again</button></div>` : ''}`
@@ -837,6 +918,7 @@ async function loadMain() {
       <td class="actions">${isAdmin() ? a.groups.map((g) => `<button class="small primary" data-act="pick" data-item="${esc(a.item_id)}" data-group="${g.id}">${esc(g.name)}</button>`).join('') +
         `<button class="small" data-act="pick" data-item="${esc(a.item_id)}" data-group="">Ignore</button>` : ''}</td></tr>`).join('')}</tbody></table>`
       : '<p class="muted">Nothing waiting.</p>'}`;
+  $$('[data-held]').forEach((c) => (c.checked = ticked.has(c.value)));
 }
 
 async function onMainClick(e) {
@@ -876,7 +958,7 @@ function renderJobs() {
         Unsubscribing an item from every member of a group also takes it out of that group.</p>
       <div class="grid2">
         <div>
-          <label>Action <select id="jAction"><option value="unsubscribe">Unsubscribe</option><option value="subscribe">Subscribe</option></select></label>
+          <label>Action <select id="jAction"><option value="">Choose…</option><option value="unsubscribe">Unsubscribe</option><option value="subscribe">Subscribe</option></select></label>
           <label>Items (Workshop links or ids; collections are expanded) <textarea id="jText" rows="6"></textarea></label>
         </div>
         <div>
@@ -896,13 +978,17 @@ function renderJobs() {
   if (sel) {
     sel.onchange = async () => {
       if (!sel.value) return;
-      const d = await api('GET', `/api/groups/${sel.value}`);
-      const ids = new Set(d.members.map((m) => m.id));
-      $$('[data-acc]').forEach((c) => (c.checked = ids.has(Number(c.value))));
+      try {
+        const d = await api('GET', `/api/groups/${sel.value}`);
+        const ids = new Set(d.members.map((m) => m.id));
+        $$('[data-acc]').forEach((c) => (c.checked = ids.has(Number(c.value))));
+      } catch (ex) {
+        toast(ex.message, true);
+      }
       sel.value = '';
     };
   }
-  loadJobs();
+  return loadJobs();
 }
 
 async function loadJobs() {
@@ -919,6 +1005,17 @@ async function loadJobs() {
     : '<p class="muted">No jobs yet.</p>';
 }
 
+/** A job on its way, and the exact job the clash warning on screen is about. */
+let jobBusy = false;
+let jobClash = '';
+
+function showClash(job, conflicts) {
+  jobClash = JSON.stringify(job);
+  $('#jConflicts').innerHTML = `<div class="card" style="background:var(--warn-bg);margin-top:10px"><b>This job clashes with a group</b>
+    <ul>${conflicts.map((c) => `<li>${esc(c)}</li>`).join('')}</ul>
+    <button data-act="force" class="danger">Run it anyway</button></div>`;
+}
+
 async function onJobsClick(e) {
   const b = e.target.closest('[data-act]');
   if (!b) return;
@@ -930,24 +1027,36 @@ async function onJobsClick(e) {
         return $$('[data-acc]').forEach((c) => (c.checked = false));
       case 'submit':
       case 'force': {
-        const body = {
-          action: $('#jAction').value, text: $('#jText').value, accounts: $$('[data-acc]:checked').map((c) => Number(c.value)),
-          confirm: b.dataset.act === 'force',
-        };
+        if (jobBusy) return;
+        const job = { action: $('#jAction').value, text: $('#jText').value, accounts: $$('[data-acc]:checked').map((c) => Number(c.value)) };
+        if (!job.action) return toast('Choose what the job should do', true);
+        // "Run it anyway" only stands for the job the warning showed: an edited one is checked again.
+        const force = b.dataset.act === 'force' && jobClash === JSON.stringify(job);
+        const run = $('[data-act=submit]');
+        jobBusy = true;
+        run.disabled = true;
         $('#jResult').textContent = 'Looking the items up on Steam…';
         $('#jConflicts').innerHTML = '';
+        jobClash = '';
         try {
-          const r = await api('POST', '/api/jobs', body);
+          if (job.action === 'unsubscribe' && !force) {
+            const p = await api('POST', '/api/jobs', { ...job, preview: true });
+            $('#jResult').textContent = '';
+            if (p.conflicts.length) return showClash(job, p.conflicts);
+            const leaving = p.takenOut ? ` ${plural(p.takenOut, 'item')} will also leave ${p.groups.join(', ')}.` : '';
+            if (!(await confirmDialog('Unsubscribe', `Unsubscribe ${plural(p.items, 'item')} from ${plural(p.accounts, 'account')} (${plural(p.writes, 'write')})?${leaving}`, 'Unsubscribe', true))) return;
+          }
+          const r = await api('POST', '/api/jobs', { ...job, confirm: force });
           $('#jResult').textContent = `Job ${r.id} queued.${r.skipped?.length ? ` Skipped ${r.skipped.length} unknown item(s).` : ''}`;
           $('#jText').value = '';
           loadJobs();
         } catch (ex) {
           $('#jResult').textContent = '';
-          if (ex.status === 409 && ex.data?.conflicts) {
-            $('#jConflicts').innerHTML = `<div class="card" style="background:var(--warn-bg);margin-top:10px"><b>This job clashes with a group</b>
-              <ul>${ex.data.conflicts.map((c) => `<li>${esc(c)}</li>`).join('')}</ul>
-              <button data-act="force" class="danger">Run it anyway</button></div>`;
-          } else throw ex;
+          if (ex.status === 409 && ex.data?.conflicts) showClash(job, ex.data.conflicts);
+          else throw ex;
+        } finally {
+          jobBusy = false;
+          run.disabled = false;
         }
         return;
       }
@@ -955,8 +1064,9 @@ async function onJobsClick(e) {
         await api('POST', `/api/jobs/${b.dataset.id}/cancel`);
         return loadJobs();
       case 'jobInfo': {
-        const { items } = await api('GET', `/api/jobs/${b.dataset.id}`);
-        return openDialog(`<h2>Job ${esc(b.dataset.id)}</h2><div class="table-wrap" style="max-height:60vh"><table>
+        const { items, total } = await api('GET', `/api/jobs/${b.dataset.id}`);
+        return openDialog(`<h2>Job ${esc(b.dataset.id)}</h2>${total > items.length ? `<p class="small muted">Showing the first ${items.length} of ${total}.</p>` : ''}
+          <div class="table-wrap" style="max-height:60vh"><table>
           <thead><tr><th>Account</th><th>Item</th><th>State</th></tr></thead><tbody>${items.map((i) => `<tr><td>${esc(i.username)}</td>
           <td><a href="${workshopUrl(i.item_id)}" target="_blank" rel="noopener">${esc(i.title || i.item_id)}</a></td>
           <td>${i.state === 'failed' ? `<span class="error">${esc(i.error)}</span>` : 'waiting'}</td></tr>`).join('')}</tbody></table></div>
@@ -981,9 +1091,9 @@ function renderHistory() {
       <label class="check" style="margin:0"><input type="checkbox" id="hAlerts"> Important only</label>
       <button data-act="reload">Refresh</button></div>
     <div class="card table-wrap" id="hList"><p class="muted">Loading…</p></div>`;
-  view.onchange = loadHistory;
-  view.onclick = (e) => e.target.closest('[data-act=reload]') && loadHistory();
-  loadHistory();
+  view.onchange = () => loadHistory().catch(showLoadError);
+  view.onclick = (e) => e.target.closest('[data-act=reload]') && loadHistory().catch(showLoadError);
+  return loadHistory();
 }
 
 async function loadHistory() {
@@ -1050,7 +1160,10 @@ async function renderSettings() {
     const h = hint ? `<div class="small muted">${esc(hint)}</div>` : '';
     if (type === 'flag') return `<label class="check"><input type="checkbox" name="${key}" ${s[key] === '1' ? 'checked' : ''}> ${esc(label)}</label>`;
     if (type === 'area') return `<label>${esc(label)}<textarea name="${key}" rows="4">${esc(s[key])}</textarea></label>`;
-    if (type === 'secret') return `<label>${esc(label)} ${s[`${key}_set`] ? '<span class="badge ok">set</span>' : ''}<input type="password" name="${key}" placeholder="${s[`${key}_set`] ? 'blank = keep' : ''}" autocomplete="off"></label>`;
+    if (type === 'secret') {
+      return `<label>${esc(label)} ${s[`${key}_set`] ? '<span class="badge ok">set</span>' : ''}<input type="password" name="${key}" placeholder="${s[`${key}_set`] ? 'blank = keep' : ''}" autocomplete="off"></label>
+        ${s[`${key}_set`] ? `<label class="check"><input type="checkbox" name="${key}_clear"> Remove the saved ${esc(label.toLowerCase())}</label>` : ''}`;
+    }
     return `<label>${esc(label)}${def}<input name="${key}" type="${type}" value="${esc(s[key])}">${h}</label>`;
   };
   view.innerHTML = `<h1>Settings</h1><form id="settingsForm">
@@ -1073,6 +1186,7 @@ async function renderSettings() {
         body[key] = type === 'flag' ? (el.checked ? '1' : '0') : el.value;
       }
     }
+    if (form.elements.telegram_bot_token_clear?.checked) body.telegram_bot_token_clear = true;
     body.viewer_password = form.elements.viewer_password.value;
     if (form.elements.viewer_password_clear?.checked) body.viewer_password_clear = true;
     try {
@@ -1086,7 +1200,7 @@ async function renderSettings() {
   view.onclick = async (e) => {
     if (!e.target.closest('[data-act=tgTest]')) return;
     try {
-      await api('POST', '/api/telegram/test');
+      await api('POST', '/api/telegram/test', { telegram_bot_token: form.elements.telegram_bot_token.value, telegram_chat_id: form.elements.telegram_chat_id.value });
       toast('Test message sent');
     } catch (ex) {
       toast(ex.message, true);
@@ -1099,16 +1213,24 @@ async function renderSettings() {
 // ---------------------------------------------------------------------------
 function renderLogs() {
   view.innerHTML = '<div class="toolbar"><h1 style="margin:0">Logs</h1></div><div class="card"><pre id="logBox" class="logs">Loading…</pre></div>';
-  loadLogs();
+  logsShown = '';
+  return loadLogs();
 }
+
+let logsShown = '';
 
 async function loadLogs() {
   if (route.tab !== 'logs' || !isAdmin()) return;
   const { logs } = await api('GET', '/api/logs');
   const box = $('#logBox');
   if (!box) return;
+  const html = logs.map((l) => `<span class="lvl-${l.level}">${esc(fmtTime(l.ts))} ${esc(l.msg)}</span>`).join('\n');
+  const selection = getSelection();
+  // Someone copying a line: the page catches up once the selection is gone.
+  if (html === logsShown || (selection && !selection.isCollapsed && box.contains(selection.anchorNode))) return;
+  logsShown = html;
   const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
-  box.innerHTML = logs.map((l) => `<span class="lvl-${l.level}">${esc(fmtTime(l.ts))} ${esc(l.msg)}</span>`).join('\n');
+  box.innerHTML = html;
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
 

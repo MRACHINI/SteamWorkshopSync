@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import fastifyStatic from '@fastify/static';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
-import { ADMIN_PASSWORD, DATA_DIR, DEFAULT_SETTINGS, HOST, PORT, PUBLIC_ORIGIN, TRUST_PROXY } from './config.js';
+import { ADMIN_PASSWORD, DATA_DIR, DEFAULT_SETTINGS, HOST, PORT, PUBLIC_ORIGIN, TLS_CERT_FILE, TLS_KEY_FILE, TRUST_PROXY } from './config.js';
 import { encrypt, hashPassword, safeEqual, sign, verifyPassword } from './crypto.js';
 import {
   STUCK, addEvent, getAccount, getAccountByName, getInternal, getSettings, numSetting, q, setInternal, setSettings, updateAccount,
@@ -13,7 +13,7 @@ import {
   removeCollection, resolveApproval, resolveHeld, setMain, updateGroup, validateGroupInput,
 } from './groups.js';
 import { parseImportText, upsertAccount } from './importer.js';
-import { cancelJob, createJob, jobFailures, listJobs, resolveForJob } from './jobs.js';
+import { cancelJob, createJob, jobFailureTotal, jobFailures, listJobs, previewJob, resolveForJob } from './jobs.js';
 import { errMsg, log } from './log.js';
 import { parseRefs } from './refs.js';
 import { requestCheck, scanState, wakeScheduler } from './scheduler.js';
@@ -24,6 +24,13 @@ import { failedCount, pendingCount, sendNow } from './telegram.js';
 import { groupDetail, groupItemsList, groupSummaries, itemCells, publicAccounts } from './views.js';
 
 const SESSION_MS = 30 * 24 * 3600_000;
+/** How long a browser that signed in as admin keeps its own login limit. */
+const DEVICE_MS = 365 * 24 * 3600_000;
+/** With no sign of life from the sync for this long, the health check fails. */
+const HEALTH_STALL_MS = 15 * 60_000;
+/** Example values, which anyone could guess: treated as not set. */
+const PLACEHOLDER_PASSWORDS = new Set(['change-me', 'changeme', 'change_me', 'password', 'admin']);
+const MAIN_PASSWORD_REFUSED = "The main account's password is never stored. Leave it empty and sign the account in from the web UI.";
 const LOGIN_MAX_FAILURES = 10;
 const LOGIN_WINDOW_MS = 10 * 60_000;
 const SECRET_SETTINGS = new Set(['telegram_bot_token']);
@@ -44,8 +51,24 @@ function withoutDefaultPort(host: string, protocol: string): string {
   return host.replace(scheme === 'https' ? /:443$/ : /:80$/, '');
 }
 
+/**
+ * What the login limiter counts failures by. A client on IPv6 usually controls a whole /64, so that is the unit
+ * there; an IPv4 address written as IPv6 is the IPv4 address.
+ */
+function limiterKey(ip: string): string {
+  const mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i)?.[1];
+  if (mapped) return mapped;
+  if (!ip.includes(':')) return ip;
+  const [head, tail = ''] = ip.split('%')[0].split('::');
+  const start = head ? head.split(':') : [];
+  const end = tail ? tail.split(':') : [];
+  const groups = [...start, ...Array<string>(Math.max(0, 8 - start.length - end.length)).fill('0'), ...end];
+  return `${groups.slice(0, 4).map((g) => g.toLowerCase().replace(/^0+(?=.)/, '')).join(':')}::/64`;
+}
+
 function adminPassword(): string {
-  if (ADMIN_PASSWORD) return ADMIN_PASSWORD;
+  if (ADMIN_PASSWORD && !PLACEHOLDER_PASSWORDS.has(ADMIN_PASSWORD.toLowerCase())) return ADMIN_PASSWORD;
+  if (ADMIN_PASSWORD) log.warn(`ADMIN_PASSWORD is the example value "${ADMIN_PASSWORD}", which anyone could guess. It is ignored.`);
   const file = path.join(DATA_DIR, 'admin-password.txt');
   if (!fs.existsSync(file)) {
     fs.writeFileSync(file, crypto.randomBytes(9).toString('base64url'), { mode: 0o600 });
@@ -128,18 +151,22 @@ export async function startServer(): Promise<{ close: () => Promise<void> }> {
   } else if (TRUST_PROXY && !/^(0|false|no|off)$/i.test(TRUST_PROXY)) {
     trustProxy = TRUST_PROXY;
   }
+  const https = TLS_CERT_FILE && TLS_KEY_FILE ? { https: { cert: fs.readFileSync(TLS_CERT_FILE), key: fs.readFileSync(TLS_KEY_FILE) } } : {};
+  const options = { logger: false, bodyLimit: 2 * 1024 * 1024, ...https } as { logger: false; bodyLimit: number };
   let app;
   try {
-    app = Fastify({ logger: false, bodyLimit: 2 * 1024 * 1024, trustProxy });
+    app = Fastify({ ...options, trustProxy });
   } catch (e) {
     log.error(`Invalid TRUST_PROXY "${TRUST_PROXY}" (${errMsg(e)}). Ignoring it.`);
-    app = Fastify({ logger: false, bodyLimit: 2 * 1024 * 1024 });
+    app = Fastify(options);
   }
 
   // --- auth ---------------------------------------------------------------
   // Session cookie = role.expiry.signature. The signature also covers the current password (hash) of that
   // role, so changing the admin or viewer password signs out every session of that role.
-  // Login limiter: at most LOGIN_MAX_FAILURES failed attempts per IP in any sliding LOGIN_WINDOW_MS.
+  // Login limiter: at most LOGIN_MAX_FAILURES failed attempts per IP in any sliding LOGIN_WINDOW_MS. A browser
+  // that signed in as admin before has a limit of its own, so others failing from the same address (everyone
+  // behind one proxy or NAT) cannot lock the admin out.
   const failures = new Map<string, { fails: number[]; pending: number }>();
   const dropOldFailures = (entry: { fails: number[] }, now: number) => {
     entry.fails = entry.fails.filter((t) => t > now - LOGIN_WINDOW_MS);
@@ -166,11 +193,23 @@ export async function startServer(): Promise<{ close: () => Promise<void> }> {
     if ((role !== 'admin' && role !== 'viewer') || !exp || !sig || !(Number(exp) > Date.now())) return null;
     const epoch = passwordEpoch(role);
     if (!epoch) return null; // viewer access disabled
-    return safeEqual(sig, sign(`session:${role}:${exp}:${epoch}`)) ? role : null;
+    if (!safeEqual(sig, sign(`session:${role}:${exp}:${epoch}`))) return null;
+    return q('SELECT 1 FROM revoked_sessions WHERE sig = ?').get(sig) ? null : role;
   };
-  const cookieOf = (req: FastifyRequest) => req.headers.cookie?.match(/(?:^|;\s*)sws_session=([^;]+)/)?.[1];
-  const setSession = (reply: FastifyReply, value: string, maxAge: number) =>
-    reply.header('Set-Cookie', `sws_session=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}`);
+  const cookieOf = (req: FastifyRequest, name = 'sws_session') => req.headers.cookie?.match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`))?.[1];
+  const secure = (req: FastifyRequest) => (req.protocol === 'https' ? '; Secure' : '');
+  const setSession = (req: FastifyRequest, reply: FastifyReply, value: string, maxAge: number) =>
+    reply.header('Set-Cookie', `sws_session=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${secure(req)}`);
+  const deviceSig = (exp: string) => sign(`device:${exp}:${passwordEpoch('admin')}`);
+  const setDevice = (req: FastifyRequest, reply: FastifyReply) => {
+    const exp = String(Date.now() + DEVICE_MS);
+    reply.header('Set-Cookie', `sws_device=${exp}.${deviceSig(exp)}; Path=/api/login; HttpOnly; SameSite=Strict; Max-Age=${DEVICE_MS / 1000}${secure(req)}`);
+  };
+  const knownDevice = (req: FastifyRequest) => {
+    const [exp, sig] = (cookieOf(req, 'sws_device') ?? '').split('.');
+    return !!exp && !!sig && Number(exp) > Date.now() && safeEqual(sig, deviceSig(exp));
+  };
+  let proxyWarned = false;
 
   app.decorateRequest('role', null);
 
@@ -218,8 +257,13 @@ export async function startServer(): Promise<{ close: () => Promise<void> }> {
 
   app.post('/api/login', async (req, reply) => {
     if (failures.size > pruneAbove) pruneFailures();
-    let entry = failures.get(req.ip);
-    if (!entry) failures.set(req.ip, (entry = { fails: [], pending: 0 }));
+    if (!trustProxy && req.headers['x-forwarded-for'] && !proxyWarned) {
+      proxyWarned = true;
+      log.warn("Sign-ins come through a reverse proxy, but TRUST_PROXY is not set: every visitor shares one login limit. Set it to the proxy's address.");
+    }
+    const key = `${knownDevice(req) ? 'device:' : ''}${limiterKey(req.ip)}`;
+    let entry = failures.get(key);
+    if (!entry) failures.set(key, (entry = { fails: [], pending: 0 }));
     dropOldFailures(entry, Date.now());
     // Attempts still being checked count too: the viewer check is async, and concurrent requests must not
     // all get past this line before any of them has recorded its failure.
@@ -241,18 +285,24 @@ export async function startServer(): Promise<{ close: () => Promise<void> }> {
       // Only the admin password clears earlier failures. A viewer login leaves them (and their age) untouched,
       // so a viewer cannot reset the count between guesses at the admin password.
       if (role === 'admin') entry.fails = [];
-      if (!entry.fails.length && !entry.pending && failures.get(req.ip) === entry) failures.delete(req.ip);
+      if (!entry.fails.length && !entry.pending && failures.get(key) === entry) failures.delete(key);
     }
     if (!role) {
       log.warn(`Failed web login from ${req.ip}`);
       return reply.code(401).send({ error: 'Wrong password' });
     }
-    setSession(reply, makeToken(role), SESSION_MS / 1000);
+    setSession(req, reply, makeToken(role), SESSION_MS / 1000);
+    if (role === 'admin') setDevice(req, reply);
     return { ok: true, role };
   });
 
-  app.post('/api/logout', async (_req, reply) => {
-    setSession(reply, '', 0);
+  app.post('/api/logout', async (req, reply) => {
+    const token = cookieOf(req);
+    if (roleOf(token)) {
+      const [, exp, sig] = token!.split('.');
+      q('INSERT OR IGNORE INTO revoked_sessions (sig, exp) VALUES (?, ?)').run(sig, Number(exp));
+    }
+    setSession(req, reply, '', 0);
     return { ok: true };
   });
 
@@ -265,6 +315,7 @@ export async function startServer(): Promise<{ close: () => Promise<void> }> {
       now: Date.now(),
       role: (req as FastifyRequest & { role: Role }).role,
       timezone: s.timezone,
+      tokenWarnDays: numSetting('token_warn_days', 1, 180),
       scan: {
         ...scanState,
         pausedUntil: syncState.pausedUntil,
@@ -279,7 +330,7 @@ export async function startServer(): Promise<{ close: () => Promise<void> }> {
         pending: pendingCount(), failed: failedCount(),
       },
       approvals: (q("SELECT COUNT(*) AS n FROM approvals WHERE status = 'pending'").get() as { n: number }).n,
-      held: (q('SELECT COUNT(*) AS n FROM account_items WHERE removal_held = 1').get() as { n: number }).n,
+      held: (q('SELECT COUNT(*) AS n FROM account_items WHERE removal_held != 0').get() as { n: number }).n,
       runningJobs: (q("SELECT COUNT(*) AS n FROM jobs WHERE status = 'running'").get() as { n: number }).n,
       accounts: publicAccounts(),
       groups: groupSummaries(),
@@ -291,11 +342,13 @@ export async function startServer(): Promise<{ close: () => Promise<void> }> {
     const b = body(req);
     try {
       const username = String(b.username ?? '').trim();
-      const result = upsertAccount({ username, password: typeof b.password === 'string' ? b.password : '', note: typeof b.note === 'string' ? b.note : undefined });
+      const accountPassword = typeof b.password === 'string' ? b.password : '';
+      if (b.is_main === true && accountPassword) return reply.code(400).send({ error: MAIN_PASSWORD_REFUSED });
+      const result = upsertAccount({ username, password: accountPassword, note: typeof b.note === 'string' ? b.note : undefined });
       const saved = getAccountByName(username)!;
-      if (b.is_main === true) setMain(saved.id);
-      addEvent(null, 'admin', `Account ${username} ${result}${b.is_main === true ? ' as the main account' : ''}`);
-      if (saved.password_enc) requestCheck(saved.id);
+      if (b.is_main === true && !saved.is_main) setMain(saved.id);
+      addEvent(null, 'admin', `Account ${username} ${result}`);
+      if (saved.password_enc && b.is_main !== true) requestCheck(saved.id);
       return { ok: true, result, id: saved.id };
     } catch (e) {
       return reply.code(400).send({ error: errMsg(e) });
@@ -304,9 +357,15 @@ export async function startServer(): Promise<{ close: () => Promise<void> }> {
 
   app.post('/api/accounts/import', async (req, reply) => {
     const added: string[] = [];
+    const skipped: string[] = [];
     try {
       for (const it of parseImportText(String(body(req).text ?? ''))) {
         if (!it.password) throw new Error(`${it.username}: no password (add accounts without a password one at a time and sign them in)`);
+        // Its password is never stored, and one line of a long list should not stop the rest.
+        if (getAccountByName(it.username.trim())?.is_main) {
+          skipped.push(it.username);
+          continue;
+        }
         upsertAccount(it);
         added.push(it.username);
       }
@@ -315,7 +374,7 @@ export async function startServer(): Promise<{ close: () => Promise<void> }> {
     }
     addEvent(null, 'admin', `Bulk import: ${added.length} accounts`);
     wakeScheduler();
-    return { ok: true, count: added.length };
+    return { ok: true, count: added.length, skipped };
   });
 
   app.put('/api/accounts/:id', async (req, reply) => {
@@ -323,6 +382,7 @@ export async function startServer(): Promise<{ close: () => Promise<void> }> {
     const acc = getAccount(id);
     if (!acc) return reply.code(404).send({ error: 'not found' });
     const b = body(req);
+    if (b.password && (b.is_main === true || (acc.is_main && b.is_main !== false))) return reply.code(400).send({ error: MAIN_PASSWORD_REFUSED });
     const fields: Parameters<typeof updateAccount>[1] = {};
     if (typeof b.note === 'string') fields.note = b.note;
     const enabling = b.enabled === true && !acc.enabled;
@@ -356,6 +416,7 @@ export async function startServer(): Promise<{ close: () => Promise<void> }> {
     const id = idParam(req);
     const acc = getAccount(id);
     if (!acc) return reply.code(404).send({ error: 'not found' });
+    if (!acc.enabled) return reply.code(409).send({ error: 'This account is disabled' });
     if (STUCK.has(acc.status)) {
       return reply.code(409).send({ error: acc.status === 'needs_signin' ? 'Sign this account in first' : 'Fix the account password first' });
     }
@@ -544,7 +605,7 @@ export async function startServer(): Promise<{ close: () => Promise<void> }> {
   // --- one-shot jobs --------------------------------------------------------
   app.get('/api/jobs', async () => ({ jobs: listJobs() }));
 
-  app.get('/api/jobs/:id', async (req) => ({ items: jobFailures(idParam(req)) }));
+  app.get('/api/jobs/:id', async (req) => ({ items: jobFailures(idParam(req)), total: jobFailureTotal(idParam(req)) }));
 
   app.post('/api/jobs', async (req, reply) => {
     const b = body(req);
@@ -557,12 +618,13 @@ export async function startServer(): Promise<{ close: () => Promise<void> }> {
     if (!accounts.length) return reply.code(400).send({ error: 'Select at least one account' });
     let resolved;
     try {
-      resolved = await resolveForJob(ids, numSetting('request_timeout_seconds', 5, 120) * 1000);
+      resolved = await resolveForJob(ids, numSetting('request_timeout_seconds', 5, 120) * 1000, b.action);
     } catch (e) {
       return reply.code(502).send({ error: `Steam did not answer: ${errMsg(e)}` });
     }
     if (!resolved.items.length) return reply.code(400).send({ error: 'None of these items exist on Steam', skipped: resolved.skipped });
     try {
+      if (b.preview === true) return { ...previewJob(b.action, resolved.items, accounts), skipped: resolved.skipped };
       const r = createJob(b.action, resolved.items, accounts, b.confirm === true);
       if (r.conflicts) return reply.code(409).send({ error: 'This job clashes with a group', conflicts: r.conflicts });
       wakeScheduler();
@@ -624,6 +686,10 @@ export async function startServer(): Promise<{ close: () => Promise<void> }> {
       if (safeEqual(viewerPw, password)) return reply.code(400).send({ error: 'Viewer password must differ from the admin password' });
     }
     setSettings(b);
+    if (b.telegram_bot_token_clear === true) {
+      setSettings({ telegram_bot_token: '' });
+      addEvent(null, 'admin', 'Telegram bot token removed');
+    }
     if (b.viewer_password_clear === true) {
       setInternal('viewer_password_hash', '');
       addEvent(null, 'admin', 'Viewer access disabled');
@@ -636,9 +702,11 @@ export async function startServer(): Promise<{ close: () => Promise<void> }> {
     return { ok: true };
   });
 
-  app.post('/api/telegram/test', async (_req, reply) => {
+  // Uses the values on screen where given, so they can be tried before saving them.
+  app.post('/api/telegram/test', async (req, reply) => {
+    const b = body(req);
     try {
-      await sendNow('✅ SteamWorkshopSync test message');
+      await sendNow('✅ SteamWorkshopSync test message', { token: String(b.telegram_bot_token ?? '').trim(), chatId: String(b.telegram_chat_id ?? '').trim() });
       return { ok: true };
     } catch (e) {
       return reply.code(400).send({ error: errMsg(e) });
@@ -666,11 +734,14 @@ export async function startServer(): Promise<{ close: () => Promise<void> }> {
 
   app.get('/api/logs', async () => ({ logs: log.tail(400) }));
 
-  app.get('/healthz', async () => ({ ok: true, lastCycleAt: scanState.lastCycleAt }));
+  app.get('/healthz', async (_req, reply) => {
+    const ok = Date.now() - syncState.lastBeatAt < HEALTH_STALL_MS;
+    return reply.code(ok ? 200 : 503).send({ ok, lastCycleAt: scanState.lastCycleAt });
+  });
 
   await app.register(fastifyStatic, { root: path.join(import.meta.dirname, '..', 'public') });
 
   await app.listen({ port: PORT, host: HOST });
-  log.info(`Web interface listening on http://${HOST}:${PORT}`);
+  log.info(`Web interface listening on ${TLS_CERT_FILE && TLS_KEY_FILE ? 'https' : 'http'}://${HOST}:${PORT}`);
   return app;
 }
